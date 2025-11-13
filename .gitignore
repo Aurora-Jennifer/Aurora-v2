@@ -1,0 +1,21 @@
+# block data
+data/ 
+datasets/
+*.csv
+*.parquet
+*.h5
+*.pkl
+models/weights/
+results/
+DATA_PROCESSING/data
+
+# random junk
+__pycahce__/
+*.pay[cod]
+venv/
+.env
+.ipynb_checkpoints/
+
+#sys junk 
+.DS_Store
+*.swp
