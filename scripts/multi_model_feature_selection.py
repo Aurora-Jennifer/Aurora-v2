@@ -164,19 +164,37 @@ def safe_load_dataframe(file_path: Path) -> pd.DataFrame:
 
 
 def extract_native_importance(model, feature_names: List[str]) -> pd.Series:
-    """Extract native feature importance from tree-based models"""
+    """Extract native feature importance from various model types"""
     if hasattr(model, 'feature_importance'):
         # LightGBM
         importance = model.feature_importance(importance_type='gain')
+    elif hasattr(model, 'get_feature_importance'):
+        # CatBoost
+        importance = model.get_feature_importance()
     elif hasattr(model, 'feature_importances_'):
-        # sklearn models (RF, XGBoost sklearn API, etc.)
+        # sklearn models (RF, XGBoost sklearn API, HistGradientBoosting, etc.)
         importance = model.feature_importances_
+    elif hasattr(model, 'coef_'):
+        # Linear models (Lasso, Ridge, ElasticNet)
+        importance = np.abs(model.coef_)
     elif hasattr(model, 'get_score'):
         # XGBoost native API
         score_dict = model.get_score(importance_type='gain')
         importance = np.array([score_dict.get(f, 0.0) for f in feature_names])
+    elif hasattr(model, 'importance'):
+        # Dummy model for mutual information
+        importance = model.importance
     else:
-        raise ValueError("Model does not have native feature importance")
+        raise ValueError(f"Model does not have native feature importance. Available attributes: {dir(model)}")
+    
+    # Ensure importance matches feature_names length
+    if len(importance) != len(feature_names):
+        logger.warning(f"Importance length ({len(importance)}) doesn't match features ({len(feature_names)})")
+        # Pad or truncate if needed
+        if len(importance) < len(feature_names):
+            importance = np.pad(importance, (0, len(feature_names) - len(importance)), 'constant')
+        else:
+            importance = importance[:len(feature_names)]
     
     return pd.Series(importance, index=feature_names)
 
@@ -256,6 +274,20 @@ def train_model_and_get_importance(
 ) -> Tuple[Any, pd.Series, str]:
     """Train a single model family and extract importance"""
     
+    # Validate target before training
+    sys.path.insert(0, str(_REPO_ROOT / "scripts" / "utils"))
+    try:
+        from target_validation import validate_target
+        is_valid, error_msg = validate_target(y, min_samples=10, min_class_samples=2)
+        if not is_valid:
+            logger.debug(f"    {model_family}: {error_msg}")
+            return None, pd.Series(0.0, index=feature_names), family_config['importance_method'], 0.0
+    except ImportError:
+        # Fallback
+        unique_vals = np.unique(y[~np.isnan(y)])
+        if len(unique_vals) < 2:
+            return None, pd.Series(0.0, index=feature_names), family_config['importance_method'], 0.0
+    
     importance_method = family_config['importance_method']
     model_config = family_config['config']
     
@@ -274,8 +306,15 @@ def train_model_and_get_importance(
         try:
             import xgboost as xgb
             model = xgb.XGBRegressor(**model_config)
-            model.fit(X, y)
-            train_score = model.score(X, y)
+            try:
+                model.fit(X, y)
+                train_score = model.score(X, y)
+            except (ValueError, TypeError) as e:
+                error_str = str(e).lower()
+                if any(kw in error_str for kw in ['invalid classes', 'expected', 'too few']):
+                    logger.debug(f"    XGBoost: Target degenerate")
+                    return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
+                raise
         except ImportError:
             logger.error("XGBoost not available")
             return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
@@ -300,11 +339,228 @@ def train_model_and_get_importance(
         X_scaled = scaler.fit_transform(X_imputed)
         
         model = MLPRegressor(**model_config, random_state=42)
-        model.fit(X_scaled, y)
-        train_score = model.score(X_scaled, y)
+        try:
+            model.fit(X_scaled, y)
+            train_score = model.score(X_scaled, y)
+        except (ValueError, TypeError) as e:
+            error_str = str(e).lower()
+            if any(kw in error_str for kw in ['least populated class', 'too few', 'invalid classes']):
+                logger.debug(f"    Neural Network: Target too imbalanced")
+                return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
+            raise
         
         # Use scaled data for importance
         X = X_scaled
+    
+    elif model_family == 'catboost':
+        try:
+            import catboost as cb
+            # Determine task type
+            unique_vals = np.unique(y[~np.isnan(y)])
+            is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+            is_multiclass = len(unique_vals) <= 10 and all(
+                isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+                for v in unique_vals
+            )
+            
+            if is_binary:
+                model = cb.CatBoostClassifier(**model_config, verbose=False)
+            elif is_multiclass:
+                model = cb.CatBoostClassifier(**model_config, verbose=False)
+            else:
+                model = cb.CatBoostRegressor(**model_config, verbose=False)
+            
+            try:
+                model.fit(X, y)
+                train_score = model.score(X, y)
+            except (ValueError, TypeError) as e:
+                error_str = str(e).lower()
+                if any(kw in error_str for kw in ['invalid classes', 'expected', 'too few']):
+                    logger.debug(f"    CatBoost: Target degenerate")
+                    return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
+                raise
+        except ImportError:
+            logger.error("CatBoost not available (pip install catboost)")
+            return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
+    
+    elif model_family == 'lasso':
+        from sklearn.linear_model import Lasso
+        model = Lasso(**model_config, random_state=42)
+        model.fit(X, y)
+        train_score = model.score(X, y)
+    
+    elif model_family == 'mutual_information':
+        # Mutual information doesn't train a model, just calculates information
+        from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
+        # Determine task type
+        unique_vals = np.unique(y[~np.isnan(y)])
+        is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+        is_multiclass = len(unique_vals) <= 10 and all(
+            isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+            for v in unique_vals
+        )
+        
+        if is_binary or is_multiclass:
+            importance_values = mutual_info_classif(X, y, random_state=42, discrete_features='auto')
+        else:
+            importance_values = mutual_info_regression(X, y, random_state=42, discrete_features='auto')
+        
+        # Create a dummy model for compatibility (mutual info doesn't need a model)
+        class DummyModel:
+            def __init__(self, importance):
+                self.importance = importance
+            def get_feature_importance(self):
+                return self.importance
+        
+        model = DummyModel(importance_values)
+        train_score = 0.0  # No model to score
+    
+    elif model_family == 'univariate_selection':
+        # Univariate Feature Selection (f_regression/f_classif)
+        from sklearn.feature_selection import f_regression, f_classif, chi2
+        
+        # Determine task type
+        unique_vals = np.unique(y[~np.isnan(y)])
+        is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+        is_multiclass = len(unique_vals) <= 10 and all(
+            isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+            for v in unique_vals
+        )
+        
+        if is_binary or is_multiclass:
+            scores, pvalues = f_classif(X, y)
+        else:
+            scores, pvalues = f_regression(X, y)
+        
+        # Normalize scores (F-statistics can be very large)
+        if np.max(scores) > 0:
+            importance_values = scores / np.max(scores)
+        else:
+            importance_values = scores
+        
+        class DummyModel:
+            def __init__(self, importance):
+                self.importance = importance
+        
+        model = DummyModel(importance_values)
+        train_score = 0.0  # No model to score
+    
+    elif model_family == 'rfe':
+        # Recursive Feature Elimination
+        from sklearn.feature_selection import RFE
+        from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+        
+        # Determine task type
+        unique_vals = np.unique(y[~np.isnan(y)])
+        is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+        is_multiclass = len(unique_vals) <= 10 and all(
+            isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+            for v in unique_vals
+        )
+        
+        n_features_to_select = min(model_config.get('n_features_to_select', 50), len(feature_names))
+        step = model_config.get('step', 5)
+        
+        if is_binary or is_multiclass:
+            estimator = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=1)
+        else:
+            estimator = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=1)
+        
+        selector = RFE(estimator, n_features_to_select=n_features_to_select, step=step)
+        selector.fit(X, y)
+        
+        # Convert ranking to importance (lower rank = more important)
+        # RFE ranking: 1 = selected, higher = eliminated
+        # Convert to importance: 1/rank (higher importance for lower rank)
+        ranking = selector.ranking_
+        importance_values = 1.0 / (ranking + 1e-6)  # Avoid division by zero
+        
+        class DummyModel:
+            def __init__(self, importance):
+                self.importance = importance
+        
+        model = DummyModel(importance_values)
+        train_score = selector.estimator_.score(X, y) if hasattr(selector, 'estimator_') else 0.0
+    
+    elif model_family == 'boruta':
+        # Boruta - All-relevant feature selection
+        try:
+            from boruta import BorutaPy
+            from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+            
+            # Determine task type
+            unique_vals = np.unique(y[~np.isnan(y)])
+            is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+            is_multiclass = len(unique_vals) <= 10 and all(
+                isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+                for v in unique_vals
+            )
+            
+            if is_binary or is_multiclass:
+                rf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=1)
+            else:
+                rf = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42, n_jobs=1)
+            
+            boruta = BorutaPy(rf, n_estimators='auto', verbose=0, random_state=42, max_iter=model_config.get('max_iter', 100))
+            boruta.fit(X, y)
+            
+            # Convert to importance: selected features get high importance, rejected get low
+            ranking = boruta.ranking_
+            selected = boruta.support_
+            
+            # Importance: selected=1.0, tentative=0.5, rejected=0.1
+            importance_values = np.where(selected, 1.0, np.where(ranking == 2, 0.5, 0.1))
+            
+            class DummyModel:
+                def __init__(self, importance):
+                    self.importance = importance
+            
+            model = DummyModel(importance_values)
+            train_score = rf.score(X, y) if hasattr(rf, 'score') else 0.0
+        except ImportError:
+            logger.error("Boruta not available (pip install Boruta)")
+            return None, pd.Series(0.0, index=feature_names), importance_method, 0.0
+    
+    elif model_family == 'stability_selection':
+        # Stability Selection - Bootstrap-based feature selection
+        from sklearn.linear_model import LassoCV
+        from sklearn.linear_model import LogisticRegressionCV
+        
+        # Determine task type
+        unique_vals = np.unique(y[~np.isnan(y)])
+        is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
+        is_multiclass = len(unique_vals) <= 10 and all(
+            isinstance(v, (int, np.integer)) or (isinstance(v, float) and v.is_integer())
+            for v in unique_vals
+        )
+        
+        n_bootstrap = model_config.get('n_bootstrap', 50)  # Reduced for speed
+        stability_scores = np.zeros(X.shape[1])
+        
+        for _ in range(n_bootstrap):
+            indices = np.random.choice(len(X), size=len(X), replace=True)
+            X_boot, y_boot = X[indices], y[indices]
+            
+            try:
+                if is_binary or is_multiclass:
+                    model = LogisticRegressionCV(Cs=10, cv=3, random_state=42, max_iter=1000, n_jobs=1)
+                else:
+                    model = LassoCV(cv=3, random_state=42, max_iter=1000, n_jobs=1)
+                
+                model.fit(X_boot, y_boot)
+                stability_scores += (np.abs(model.coef_[0] if len(model.coef_.shape) > 1 else model.coef_) > 1e-6).astype(int)
+            except:
+                continue  # Skip failed bootstrap iterations
+        
+        # Normalize to 0-1 (fraction of times selected)
+        importance_values = stability_scores / n_bootstrap
+        
+        class DummyModel:
+            def __init__(self, importance):
+                self.importance = importance
+        
+        model = DummyModel(importance_values)
+        train_score = 0.0  # No single model to score
     
     else:
         logger.error(f"Unknown model family: {model_family}")

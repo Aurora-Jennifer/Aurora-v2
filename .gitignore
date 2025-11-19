@@ -9,6 +9,10 @@ models/weights/
 results/
 DATA_PROCESSING/data
 dep/
+models/
+logs/
+config/
+CONFIG/
 
 # random junk
 __pycahce__/
