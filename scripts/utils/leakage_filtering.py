@@ -72,7 +72,11 @@ def extract_target_horizon(target_name: str) -> Optional[Dict[str, any]]:
     return None
 
 
-def get_temporal_overlap_features(horizon_minutes: int, config: dict = None) -> Set[str]:
+def get_temporal_overlap_features(
+    horizon_minutes: int, 
+    all_feature_names: List[str] = None,
+    config: dict = None
+) -> Set[str]:
     """
     Get features that would create temporal overlap with target horizon.
     
@@ -111,37 +115,112 @@ def get_temporal_overlap_features(horizon_minutes: int, config: dict = None) -> 
                 if min_window <= window_minutes <= max_window:
                     excluded.add(pattern)
     
-    # For day-based horizons, exclude features with matching day windows
-    elif horizon_minutes > 1440:  # > 1 day
-        horizon_days = horizon_minutes / 1440
+    # If we have actual feature names, dynamically scan for matching windows
+    if all_feature_names:
+        # For minute-based horizons
+        if horizon_minutes <= 1440:  # <= 1 day
+            min_window = max(1, horizon_minutes // 2)
+            max_window = int(horizon_minutes * 1.5)
+            for feature_name in all_feature_names:
+                matches = re.finditer(r'(\d+)m', feature_name)
+                for match in matches:
+                    window_minutes = int(match.group(1))
+                    if (min_window <= window_minutes <= max_window) or (window_minutes >= horizon_minutes):
+                        excluded.add(feature_name)
+                        break
         
-        # Exclude features with windows in range [horizon/2, horizon*1.5] days
-        min_window_days = max(1, horizon_days / 2)
-        max_window_days = horizon_days * 1.5
-        
-        # Pattern to match: ret_XXd, vol_XXd, returns_XXd, etc.
-        for pattern in temporal_patterns:
-            # Extract window size if it's a day-based feature
-            match = re.search(r'(\d+)d', pattern)
-            if match:
-                window_days = int(match.group(1))
-                if min_window_days <= window_days <= max_window_days:
-                    excluded.add(pattern)
-        
-        # Also check for minute-based features that overlap
-        for pattern in temporal_patterns:
-            match = re.search(r'(\d+)m', pattern)
-            if match:
-                window_minutes = int(match.group(1))
-                window_days = window_minutes / 1440
-                if min_window_days <= window_days <= max_window_days:
-                    excluded.add(pattern)
+        # For day-based horizons
+        elif horizon_minutes > 1440:  # > 1 day
+            horizon_days = horizon_minutes / 1440
+            min_window_days = max(1, horizon_days / 2)
+            max_window_days = horizon_days * 1.5
+            
+            for feature_name in all_feature_names:
+                # Pattern 1: XXd
+                matches = re.finditer(r'(\d+)d', feature_name)
+                for match in matches:
+                    window_days = int(match.group(1))
+                    if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
+                        excluded.add(feature_name)
+                        break
+                
+                # Pattern 2: _XX (no suffix)
+                matches = re.finditer(r'_(\d+)(?:_|$)', feature_name)
+                for match in matches:
+                    window_value = int(match.group(1))
+                    if 1 <= window_value <= 365:
+                        window_days = window_value
+                        if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
+                            excluded.add(feature_name)
+                            break
+            
+            # Minute-based features that overlap with day horizon
+            for feature_name in all_feature_names:
+                matches = re.finditer(r'(\d+)m', feature_name)
+                for match in matches:
+                    window_minutes = int(match.group(1))
+                    window_days = window_minutes / 1440
+                    if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
+                        excluded.add(feature_name)
+                        break
+    else:
+        # Fallback: use config patterns only (old behavior)
+        if horizon_minutes <= 1440:
+            min_window = max(1, horizon_minutes // 2)
+            max_window = int(horizon_minutes * 1.5)
+            # If we have actual feature names, dynamically scan
+            if all_feature_names:
+                for feature_name in all_feature_names:
+                    # Pattern 1: XXd
+                    matches = re.finditer(r'(\d+)d', feature_name)
+                    for match in matches:
+                        window_days = int(match.group(1))
+                        if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
+                            excluded.add(feature_name)
+                            break
+                    # Pattern 2: _XX (no suffix)
+                    matches = re.finditer(r'_(\d+)(?:_|$)', feature_name)
+                    for match in matches:
+                        window_value = int(match.group(1))
+                        if 1 <= window_value <= 365:
+                            window_days = window_value
+                            if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
+                                excluded.add(feature_name)
+                                break
+                # Minute-based features that overlap
+                for feature_name in all_feature_names:
+                    matches = re.finditer(r'(\d+)m', feature_name)
+                    for match in matches:
+                        window_minutes = int(match.group(1))
+                        window_days = window_minutes / 1440
+                        if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
+                            excluded.add(feature_name)
+                            break
+                    if min_window <= window_minutes <= max_window:
+                        excluded.add(pattern)
+        elif horizon_minutes > 1440:
+            horizon_days = horizon_minutes / 1440
+            min_window_days = max(1, horizon_days / 2)
+            max_window_days = horizon_days * 1.5
+            for pattern in temporal_patterns:
+                match = re.search(r'(\d+)d', pattern)
+                if match:
+                    window_days = int(match.group(1))
+                    if min_window_days <= window_days <= max_window_days:
+                        excluded.add(pattern)
+                match = re.search(r'(\d+)m', pattern)
+                if match:
+                    window_minutes = int(match.group(1))
+                    window_days = window_minutes / 1440
+                    if min_window_days <= window_days <= max_window_days:
+                        excluded.add(pattern)
     
     return excluded
 
 
 def get_excluded_features_for_target(
     target_name: str,
+    all_feature_names: List[str] = None,
     config: dict = None,
     exclude_definite_leaks: bool = True,
     exclude_temporal_overlap: bool = True
@@ -177,7 +256,9 @@ def get_excluded_features_for_target(
         horizon_info = extract_target_horizon(target_name)
         if horizon_info:
             temporal_overlap = get_temporal_overlap_features(
-                horizon_info['minutes'], config
+                horizon_info['minutes'], 
+                all_feature_names=all_feature_names,
+                config=config
             )
             excluded.update(temporal_overlap)
             logger.debug(
@@ -232,7 +313,11 @@ def filter_features_for_target(
         config = load_exclusion_config()
     
     # Get excluded features for this target
-    excluded_set = get_excluded_features_for_target(target_name, config)
+    excluded_set = get_excluded_features_for_target(
+        target_name, 
+        all_feature_names=all_columns,
+        config=config
+    )
     
     # Get target patterns (to exclude other targets)
     target_patterns = config.get('target_patterns', []) if config.get('exclude_targets', True) else []
