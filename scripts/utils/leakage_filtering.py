@@ -4,13 +4,120 @@ Target-Aware Leakage Filtering
 Filters out features that would leak information about the target being predicted.
 Uses temporal awareness: features computed at time t cannot use information from
 time t+horizon or later.
+
+All exclusion patterns are loaded from CONFIG/excluded_features.yaml - no hardcoded patterns.
 """
 
 import re
-from typing import List, Set, Optional
+import yaml
+from typing import List, Set, Optional, Dict, Any
+from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Cache for loaded config
+_LEAKAGE_CONFIG: Optional[Dict[str, Any]] = None
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "CONFIG" / "excluded_features.yaml"
+_CONFIG_MTIME: Optional[float] = None  # Track file modification time for cache invalidation
+
+
+def _load_leakage_config(force_reload: bool = False) -> Dict[str, Any]:
+    """Load leakage filtering configuration from YAML file (cached).
+    
+    Args:
+        force_reload: If True, reload config even if cached
+    
+    Returns:
+        Config dictionary
+    """
+    global _LEAKAGE_CONFIG, _CONFIG_MTIME
+    
+    # Check if config file was modified (cache invalidation)
+    if _LEAKAGE_CONFIG is not None and not force_reload:
+        if _CONFIG_PATH.exists():
+            current_mtime = _CONFIG_PATH.stat().st_mtime
+            if _CONFIG_MTIME is not None and current_mtime > _CONFIG_MTIME:
+                # File was modified, clear cache
+                logger.info(f"Config file modified, reloading from {_CONFIG_PATH}")
+                _LEAKAGE_CONFIG = None
+                _CONFIG_MTIME = None
+        elif _CONFIG_MTIME is not None:
+            # File was deleted, clear cache
+            logger.warning(f"Config file deleted, clearing cache")
+            _LEAKAGE_CONFIG = None
+            _CONFIG_MTIME = None
+    
+    if _LEAKAGE_CONFIG is not None:
+        return _LEAKAGE_CONFIG
+    
+    if not _CONFIG_PATH.exists():
+        logger.warning(f"Leakage config not found: {_CONFIG_PATH}, using empty config")
+        _LEAKAGE_CONFIG = {
+            'always_exclude': {'regex_patterns': [], 'prefix_patterns': [], 'keyword_patterns': [], 'exact_patterns': []},
+            'target_type_rules': {},
+            'target_classification': {},
+            'horizon_extraction': {'patterns': []},
+            'metadata_columns': [],
+            'config': {}
+        }
+        return _LEAKAGE_CONFIG
+    
+    try:
+        with open(_CONFIG_PATH, 'r') as f:
+            _LEAKAGE_CONFIG = yaml.safe_load(f) or {}
+        
+        # Store modification time for cache invalidation
+        _CONFIG_MTIME = _CONFIG_PATH.stat().st_mtime
+        
+        # Ensure all required keys exist with defaults
+        defaults = {
+            'always_exclude': {'regex_patterns': [], 'prefix_patterns': [], 'keyword_patterns': [], 'exact_patterns': []},
+            'target_type_rules': {},
+            'target_classification': {},
+            'horizon_extraction': {'patterns': []},
+            'metadata_columns': [],
+            'config': {}
+        }
+        
+        for key, default_value in defaults.items():
+            if key not in _LEAKAGE_CONFIG:
+                _LEAKAGE_CONFIG[key] = default_value
+            elif isinstance(default_value, dict):
+                for subkey, subdefault in default_value.items():
+                    if subkey not in _LEAKAGE_CONFIG[key]:
+                        _LEAKAGE_CONFIG[key][subkey] = subdefault
+        
+        # Validate that we actually loaded patterns (not empty config)
+        always_exclude = _LEAKAGE_CONFIG.get('always_exclude', {})
+        total_patterns = (
+            len(always_exclude.get('regex_patterns', [])) +
+            len(always_exclude.get('prefix_patterns', [])) +
+            len(always_exclude.get('keyword_patterns', [])) +
+            len(always_exclude.get('exact_patterns', []))
+        )
+        
+        if total_patterns == 0:
+            logger.warning(
+                f"⚠️  WARNING: Config loaded but has ZERO exclusion patterns! "
+                f"This will allow all features (including leaks). "
+                f"Check {_CONFIG_PATH}"
+            )
+        else:
+            logger.debug(f"Loaded leakage config from {_CONFIG_PATH} ({total_patterns} patterns)")
+        
+        return _LEAKAGE_CONFIG
+    except Exception as e:
+        logger.error(f"Failed to load leakage config: {e}, using empty config")
+        _LEAKAGE_CONFIG = {
+            'always_exclude': {'regex_patterns': [], 'prefix_patterns': [], 'keyword_patterns': [], 'exact_patterns': []},
+            'target_type_rules': {},
+            'target_classification': {},
+            'horizon_extraction': {'patterns': []},
+            'metadata_columns': [],
+            'config': {}
+        }
+        return _LEAKAGE_CONFIG
 
 
 def filter_features_for_target(
@@ -21,11 +128,8 @@ def filter_features_for_target(
     """
     Filter features that would leak information about the target.
     
-    Uses target-aware filtering:
-    - For forward return targets (fwd_ret_*), exclude features computed from
-      future returns or overlapping time windows
-    - For barrier targets (y_will_*), exclude features that know about barrier
-      hits (tth_*, mfe_share_*, hit_direction_*, etc.)
+    All exclusion patterns are loaded from CONFIG/excluded_features.yaml.
+    Works with any dataset, features, and targets - fully configurable.
     
     Args:
         all_columns: List of all column names in the dataset
@@ -35,125 +139,216 @@ def filter_features_for_target(
     Returns:
         List of safe feature column names
     """
+    config = _load_leakage_config()
+    
     # Start with all columns except the target itself
     safe_columns = [c for c in all_columns if c != target_column]
     
+    # Exclude metadata columns if configured
+    if config.get('config', {}).get('exclude_metadata', True):
+        metadata = config.get('metadata_columns', [])
+        excluded_metadata = [c for c in safe_columns if c in metadata]
+        safe_columns = [c for c in safe_columns if c not in metadata]
+        if excluded_metadata and verbose:
+            logger.info(f"  Excluded {len(excluded_metadata)} metadata columns")
+    
     # Get target metadata
-    target_type = _classify_target_type(target_column)
-    target_horizon = _extract_horizon(target_column)
+    target_type = _classify_target_type(target_column, config)
+    target_horizon = _extract_horizon(target_column, config)
+    
+    # Apply always-exclude patterns (regardless of target type)
+    always_exclude = config.get('always_exclude', {})
+    excluded_always = _apply_exclusion_patterns(safe_columns, always_exclude, "always-exclude")
+    safe_columns = [c for c in safe_columns if c not in excluded_always]
+    if excluded_always and verbose:
+        logger.info(f"  Excluded {len(excluded_always)} always-excluded features")
     
     # Apply target-specific filtering rules
     if target_type == 'forward_return':
         safe_columns = _filter_for_forward_return_target(
-            safe_columns, target_column, target_horizon, verbose
+            safe_columns, target_column, target_horizon, config, verbose
         )
     elif target_type == 'barrier':
         safe_columns = _filter_for_barrier_target(
-            safe_columns, target_column, target_horizon, verbose
+            safe_columns, target_column, target_horizon, config, verbose
         )
     elif target_type == 'first_touch':
-        # First touch targets are already leaked (correlated with hit_direction)
-        # But we still filter features
-        safe_columns = _filter_for_barrier_target(
-            safe_columns, target_column, target_horizon, verbose
-        )
-    
-    # Always exclude these leaking features regardless of target type
-    always_exclude = _get_always_excluded_features()
-    excluded = [c for c in safe_columns if _matches_any_pattern(c, always_exclude)]
-    safe_columns = [c for c in safe_columns if c not in excluded]
-    
-    if verbose and excluded:
-        logger.info(f"  Excluded {len(excluded)} always-leaked features")
+        # First touch targets use barrier rules if configured
+        first_touch_rules = config.get('target_type_rules', {}).get('first_touch', {})
+        if first_touch_rules.get('use_barrier_rules', True):
+            safe_columns = _filter_for_barrier_target(
+                safe_columns, target_column, target_horizon, config, verbose
+            )
+        else:
+            # Apply first_touch specific rules if defined
+            first_touch_exclude = _get_target_type_exclude_patterns('first_touch', config)
+            excluded_ft = _apply_exclusion_patterns(safe_columns, first_touch_exclude, "first_touch")
+            safe_columns = [c for c in safe_columns if c not in excluded_ft]
+            if excluded_ft and verbose:
+                logger.info(f"  Excluded {len(excluded_ft)} features for first_touch target")
     
     return safe_columns
 
 
-def _classify_target_type(target_column: str) -> str:
-    """Classify target type from column name"""
-    if target_column.startswith('fwd_ret_'):
+def _classify_target_type(target_column: str, config: Dict[str, Any]) -> str:
+    """Classify target type from column name using config rules."""
+    classification = config.get('target_classification', {})
+    
+    # Check forward_return
+    fr_config = classification.get('forward_return', {})
+    if fr_config.get('prefix') and target_column.startswith(fr_config['prefix']):
         return 'forward_return'
-    elif target_column.startswith('y_will_'):
+    
+    # Check barrier
+    barrier_config = classification.get('barrier', {})
+    if barrier_config.get('prefix') and target_column.startswith(barrier_config['prefix']):
         return 'barrier'
-    elif 'first_touch' in target_column:
-        return 'first_touch'
-    else:
-        return 'unknown'
+    
+    # Check first_touch
+    ft_config = classification.get('first_touch', {})
+    if ft_config.get('keyword') and ft_config['keyword'] in target_column:
+        if ft_config.get('prefix') and target_column.startswith(ft_config['prefix']):
+            return 'first_touch'
+    
+    return 'unknown'
 
 
-def _extract_horizon(target_column: str) -> Optional[int]:
+def _extract_horizon(target_column: str, config: Dict[str, Any]) -> Optional[int]:
     """
-    Extract horizon from target column name (in minutes)
+    Extract horizon from target column name (in minutes) using config patterns.
     
     Examples:
         fwd_ret_60m -> 60
         y_will_peak_15m_0.8 -> 15
         fwd_ret_1d -> 1440 (assuming 1d = 1440 minutes)
     """
-    # Pattern: number followed by 'm', 'h', or 'd'
-    patterns = [
-        (r'(\d+)m', lambda x: int(x)),  # minutes
-        (r'(\d+)h', lambda x: int(x) * 60),  # hours -> minutes
-        (r'(\d+)d', lambda x: int(x) * 1440),  # days -> minutes
-    ]
+    horizon_config = config.get('horizon_extraction', {})
+    patterns = horizon_config.get('patterns', [])
     
-    for pattern, converter in patterns:
-        match = re.search(pattern, target_column)
-        if match:
-            return converter(match.group(1))
+    for pattern_config in patterns:
+        regex = pattern_config.get('regex')
+        multiplier = pattern_config.get('multiplier', 1)
+        
+        if regex:
+            match = re.search(regex, target_column)
+            if match:
+                value = int(match.group(1))
+                return value * multiplier
     
     return None
+
+
+def _get_target_type_exclude_patterns(target_type: str, config: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Get exclusion patterns for a specific target type."""
+    target_rules = config.get('target_type_rules', {}).get(target_type, {})
+    
+    return {
+        'regex_patterns': target_rules.get('regex_patterns', []),
+        'prefix_patterns': target_rules.get('prefix_patterns', []),
+        'keyword_patterns': target_rules.get('keyword_patterns', []),
+        'exact_patterns': target_rules.get('exact_patterns', [])
+    }
+
+
+def _apply_exclusion_patterns(
+    columns: List[str],
+    patterns: Dict[str, List[str]],
+    pattern_type: str = ""
+) -> List[str]:
+    """
+    Apply exclusion patterns to a list of columns.
+    
+    Args:
+        columns: List of column names to filter
+        patterns: Dict with keys: regex_patterns, prefix_patterns, keyword_patterns, exact_patterns
+        pattern_type: Label for logging (optional)
+    
+    Returns:
+        List of excluded column names
+    """
+    excluded = []
+    
+    # Apply regex patterns
+    for pattern in patterns.get('regex_patterns', []):
+        try:
+            regex = re.compile(pattern)
+            for col in columns:
+                if col not in excluded and regex.match(col):
+                    excluded.append(col)
+        except re.error as e:
+            logger.warning(f"Invalid regex pattern '{pattern}' in {pattern_type}: {e}")
+    
+    # Apply prefix patterns
+    for prefix in patterns.get('prefix_patterns', []):
+        for col in columns:
+            if col not in excluded and col.startswith(prefix):
+                excluded.append(col)
+    
+    # Apply keyword patterns (substring match, case-insensitive)
+    for keyword in patterns.get('keyword_patterns', []):
+        keyword_lower = keyword.lower()
+        for col in columns:
+            if col not in excluded and keyword_lower in col.lower():
+                excluded.append(col)
+    
+    # Apply exact patterns
+    exact_set = set(patterns.get('exact_patterns', []))
+    for col in columns:
+        if col not in excluded and col in exact_set:
+            excluded.append(col)
+    
+    return excluded
 
 
 def _filter_for_forward_return_target(
     columns: List[str],
     target_column: str,
     target_horizon: Optional[int],
+    config: Dict[str, Any],
     verbose: bool
 ) -> List[str]:
     """
-    Filter features for forward return targets.
-    
-    Excludes:
-    - Features computed from future returns (overlapping windows)
-    - Features that use information beyond the target horizon
+    Filter features for forward return targets using config rules.
     """
     excluded = []
     safe = []
     
+    target_rules = config.get('target_type_rules', {}).get('forward_return', {})
+    horizon_overlap = target_rules.get('horizon_overlap', {})
+    
     for col in columns:
         should_exclude = False
+        reason = None
         
-        # Exclude forward returns with overlapping or longer horizons
-        if col.startswith('fwd_ret_'):
-            col_horizon = _extract_horizon(col)
-            if col_horizon is not None and target_horizon is not None:
-                # Exclude if feature horizon >= target horizon (overlaps)
-                if col_horizon >= target_horizon:
-                    should_exclude = True
-                    excluded.append((col, "overlapping forward return"))
+        # Check if we should exclude ALL forward returns
+        if horizon_overlap.get('exclude_all', False):
+            if col.startswith('fwd_ret_'):
+                should_exclude = True
+                reason = "forward return (excluded for all targets)"
+        # Check horizon overlap if enabled (and not excluding all)
+        elif horizon_overlap.get('enabled', True) and target_horizon is not None:
+            if col.startswith('fwd_ret_'):
+                col_horizon = _extract_horizon(col, config)
+                if col_horizon is not None:
+                    exclude_if_ge = horizon_overlap.get('exclude_if_ge', True)
+                    if exclude_if_ge and col_horizon >= target_horizon:
+                        should_exclude = True
+                        reason = "overlapping forward return"
         
-        # Exclude features computed from future paths
-        if any(col.startswith(prefix) for prefix in [
-            'tth_',  # time-to-hit (knows when barrier will be hit)
-            'mfe_share_',  # fraction of time in profit (requires future path)
-            'time_in_profit_',  # duration in profit (requires future path)
-            'flipcount_',  # number of flips (requires future path)
-        ]):
+        # Apply target-type-specific exclusion patterns
+        fr_exclude = _get_target_type_exclude_patterns('forward_return', config)
+        if col in _apply_exclusion_patterns([col], fr_exclude, "forward_return"):
             should_exclude = True
-            excluded.append((col, "future path feature"))
-        
-        # Exclude barrier hit features (they're targets, not features)
-        if col.startswith('y_will_') or col.startswith('y_first_touch'):
-            should_exclude = True
-            excluded.append((col, "barrier target (not a feature)"))
+            reason = reason or "forward_return exclusion pattern"
         
         if not should_exclude:
             safe.append(col)
+        elif verbose and reason:
+            excluded.append((col, reason))
     
     if verbose and excluded:
         logger.info(f"  Excluded {len(excluded)} features for forward return target:")
-        for col, reason in excluded[:10]:  # Show first 10
+        for col, reason in excluded[:10]:
             logger.info(f"    - {col}: {reason}")
         if len(excluded) > 10:
             logger.info(f"    ... and {len(excluded) - 10} more")
@@ -165,86 +360,140 @@ def _filter_for_barrier_target(
     columns: List[str],
     target_column: str,
     target_horizon: Optional[int],
+    config: Dict[str, Any],
     verbose: bool
 ) -> List[str]:
     """
-    Filter features for barrier targets (y_will_peak, y_will_valley, etc.).
+    Filter features for barrier targets using config rules.
     
-    Excludes:
-    - Features that know about barrier hits (tth_*, hit_direction_*, etc.)
-    - Features computed from future paths
-    - First touch targets (they're leaked)
+    Target-aware filtering:
+    - Peak targets: exclude zigzag_high (but keep zigzag_low)
+    - Valley targets: exclude zigzag_low (but keep zigzag_high)
+    - CRITICAL: Exclude features with matching horizon (temporal overlap)
     """
     excluded = []
     safe = []
     
+    # Determine if this is a peak or valley target
+    is_peak_target = 'peak' in target_column.lower()
+    is_valley_target = 'valley' in target_column.lower()
+    
+    # Get barrier-specific config
+    barrier_rules = config.get('target_type_rules', {}).get('barrier', {})
+    horizon_overlap = barrier_rules.get('horizon_overlap', {})
+    exclude_matching_horizon = horizon_overlap.get('exclude_matching_horizon', True)
+    exclude_overlapping_horizon = horizon_overlap.get('exclude_overlapping_horizon', True)
+    
     for col in columns:
         should_exclude = False
+        reason = None
         
-        # Exclude features that know about barrier hits
-        if any(col.startswith(prefix) for prefix in [
-            'tth_',  # time-to-hit
-            'tth_abs_',  # absolute time-to-hit
-            'hit_direction_',  # which barrier hits first (correlated with first_touch)
-            'hit_asym_',  # asymmetric barrier hit
-        ]):
-            should_exclude = True
-            excluded.append((col, "barrier hit feature"))
+        # CRITICAL: Exclude features with matching horizon (temporal overlap)
+        # Features computed over the same time window as the target leak information
+        if exclude_matching_horizon and target_horizon is not None:
+            col_horizon = _extract_horizon(col, config)
+            if col_horizon is not None:
+                if col_horizon == target_horizon:
+                    should_exclude = True
+                    reason = f"temporal overlap (feature horizon {col_horizon}m matches target horizon {target_horizon}m)"
+                # Only exclude overlapping horizons for forward-looking features (fwd_ret_*, y_*, etc.)
+                # Standard technical indicators (RSI, MA, volatility) computed on past data are safe
+                # regardless of horizon - they represent causality, not leakage
+                elif exclude_overlapping_horizon and col_horizon >= target_horizon / 4:
+                    # Check if this is a forward-looking feature (target-like feature)
+                    is_forward_looking = (
+                        col.startswith('fwd_ret_') or
+                        col.startswith('y_') or
+                        col.startswith('p_') or
+                        col.startswith('barrier_') or
+                        'forward' in col.lower() or
+                        'future' in col.lower()
+                    )
+                    if is_forward_looking:
+                        should_exclude = True
+                        reason = f"overlapping horizon (forward-looking feature {col_horizon}m >= target {target_horizon}m/4)"
         
-        # Exclude first touch targets (they're leaked - correlated with hit_direction)
-        if 'first_touch' in col and col.startswith('y_'):
-            should_exclude = True
-            excluded.append((col, "first_touch target (leaked)"))
+        # CRITICAL: Exclude HIGH-based features for peak targets (they encode peak information)
+        # Features using HIGH prices might indicate we're already near a peak
+        if is_peak_target and not should_exclude:
+            col_lower = col.lower()
+            if any(kw in col_lower for kw in ['high', 'upper', 'max', 'top', 'ceiling']):
+                # But allow some legitimate features that use "high" in a different context
+                if not any(allow in col_lower for allow in ['high_vol', 'high_freq', 'high_corr']):
+                    should_exclude = True
+                    reason = "HIGH-based feature (excluded for peak targets - encodes peak information)"
         
-        # Exclude features computed from future paths
-        if any(col.startswith(prefix) for prefix in [
-            'mfe_share_',  # fraction of time in profit
-            'time_in_profit_',  # duration in profit
-            'flipcount_',  # number of flips
-        ]):
-            should_exclude = True
-            excluded.append((col, "future path feature"))
+        # CRITICAL: Exclude LOW-based features for valley targets (they encode valley information)
+        if is_valley_target and not should_exclude:
+            col_lower = col.lower()
+            if any(kw in col_lower for kw in ['low', 'lower', 'min', 'bottom', 'floor']):
+                # But allow some legitimate features that use "low" in a different context
+                if not any(allow in col_lower for allow in ['low_vol', 'low_freq', 'low_corr']):
+                    should_exclude = True
+                    reason = "LOW-based feature (excluded for valley targets - encodes valley information)"
         
-        # Exclude other barrier targets (they're targets, not features)
+        # Apply target-type-specific exclusion patterns
+        if not should_exclude:
+            barrier_exclude = _get_target_type_exclude_patterns('barrier', config)
+            
+            # Get keyword patterns
+            keyword_patterns = barrier_exclude.get('keyword_patterns', [])
+            
+            # Apply keyword patterns with target-aware logic for zigzag features
+            for keyword in keyword_patterns:
+                keyword_lower = keyword.lower()
+                if keyword_lower in col.lower():
+                    # Special handling for zigzag features
+                    if keyword_lower == 'zigzag_high':
+                        # Only exclude zigzag_high for peak targets
+                        if is_peak_target:
+                            should_exclude = True
+                            reason = "zigzag_high (excluded for peak targets)"
+                        # Keep zigzag_high for valley targets
+                    elif keyword_lower == 'zigzag_low':
+                        # Only exclude zigzag_low for valley targets
+                        if is_valley_target:
+                            should_exclude = True
+                            reason = "zigzag_low (excluded for valley targets)"
+                        # Keep zigzag_low for peak targets
+                    else:
+                        # For other keywords (peak, valley, swing, first_touch), apply normally
+                        should_exclude = True
+                        reason = f"barrier keyword pattern: {keyword}"
+                    break
+            
+            # Apply other exclusion patterns (regex, prefix, exact)
+            if not should_exclude:
+                other_patterns = {
+                    'regex_patterns': barrier_exclude.get('regex_patterns', []),
+                    'prefix_patterns': barrier_exclude.get('prefix_patterns', []),
+                    'exact_patterns': barrier_exclude.get('exact_patterns', [])
+                }
+                if col in _apply_exclusion_patterns([col], other_patterns, "barrier"):
+                    should_exclude = True
+                    reason = "barrier exclusion pattern"
+        
+        # Special case: exclude other barrier targets (but allow the current target)
+        # This is handled by the always-exclude y_* pattern, but we check here for clarity
         if col.startswith('y_will_') and col != target_column:
             should_exclude = True
-            excluded.append((col, "other barrier target"))
+            reason = "other barrier target"
+        
+        # Special case: keyword patterns should not exclude the target itself
+        if should_exclude and col == target_column:
+            should_exclude = False
+            reason = None
         
         if not should_exclude:
             safe.append(col)
+        elif verbose and reason:
+            excluded.append((col, reason))
     
     if verbose and excluded:
         logger.info(f"  Excluded {len(excluded)} features for barrier target:")
-        for col, reason in excluded[:10]:  # Show first 10
+        for col, reason in excluded[:10]:
             logger.info(f"    - {col}: {reason}")
         if len(excluded) > 10:
             logger.info(f"    ... and {len(excluded) - 10} more")
     
     return safe
-
-
-def _get_always_excluded_features() -> List[str]:
-    """
-    Get patterns for features that should always be excluded (regardless of target).
-    
-    These are features that leak information by definition.
-    """
-    return [
-        r'^tth_',  # time-to-hit
-        r'^tth_abs_',  # absolute time-to-hit
-        r'^mfe_share_',  # max favorable excursion share
-        r'^time_in_profit_',  # time in profit
-        r'^flipcount_',  # flip count
-        r'^hit_direction_',  # hit direction (correlated with first_touch)
-        r'^hit_asym_',  # asymmetric hit
-        r'^y_first_touch',  # first touch (leaked)
-    ]
-
-
-def _matches_any_pattern(text: str, patterns: List[str]) -> bool:
-    """Check if text matches any regex pattern"""
-    import re
-    for pattern in patterns:
-        if re.match(pattern, text):
-            return True
-    return False

@@ -74,22 +74,38 @@ class TargetPredictabilityScore:
     """Predictability assessment for a single target"""
     target_name: str
     target_column: str
-    mean_r2: float
-    std_r2: float
+    task_type: TaskType  # REGRESSION, BINARY_CLASSIFICATION, or MULTICLASS_CLASSIFICATION
+    mean_score: float  # Mean score (R² for regression, ROC-AUC for binary, accuracy for multiclass)
+    std_score: float  # Std of scores
     mean_importance: float  # Mean absolute importance
-    consistency: float  # 1 - CV(R²) - lower is better
+    consistency: float  # 1 - CV(score) - lower is better
     n_models: int
     model_scores: Dict[str, float]
     composite_score: float = 0.0
-    leakage_flag: str = "OK"  # "OK", "SUSPICIOUS", "HIGH_R2", "INCONSISTENT"
+    leakage_flag: str = "OK"  # "OK", "SUSPICIOUS", "HIGH_SCORE", "INCONSISTENT"
+    suspicious_features: Dict[str, List[Tuple[str, float]]] = None  # {model: [(feature, imp), ...]}
+    
+    # Backward compatibility: mean_r2 property
+    @property
+    def mean_r2(self) -> float:
+        """Backward compatibility: returns mean_score"""
+        return self.mean_score
+    
+    @property
+    def std_r2(self) -> float:
+        """Backward compatibility: returns std_score"""
+        return self.std_score
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
         return {
             'target_name': self.target_name,
             'target_column': self.target_column,
-            'mean_r2': float(self.mean_r2),
-            'std_r2': float(self.std_r2),
+            'task_type': self.task_type.name if hasattr(self, 'task_type') else 'REGRESSION',
+            'mean_score': float(self.mean_score),
+            'std_score': float(self.std_score),
+            'mean_r2': float(self.mean_score),  # Backward compatibility
+            'std_r2': float(self.std_score),  # Backward compatibility
             'mean_importance': float(self.mean_importance),
             'consistency': float(self.consistency),
             'n_models': int(self.n_models),
@@ -101,7 +117,28 @@ class TargetPredictabilityScore:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'TargetPredictabilityScore':
         """Create from dictionary"""
-        return cls(**d)
+        # Handle suspicious_features if present
+        suspicious = d.pop('suspicious_features', None)
+        
+        # Backward compatibility: handle old format with mean_r2/std_r2
+        if 'mean_r2' in d and 'mean_score' not in d:
+            d['mean_score'] = d['mean_r2']
+        if 'std_r2' in d and 'std_score' not in d:
+            d['std_score'] = d['std_r2']
+        
+        # Handle task_type (may be missing in old checkpoints)
+        if 'task_type' not in d:
+            # Try to infer from target name or default to REGRESSION
+            d['task_type'] = TaskType.REGRESSION
+        
+        # Convert task_type string to enum if needed
+        if isinstance(d.get('task_type'), str):
+            d['task_type'] = TaskType[d['task_type']]
+        
+        obj = cls(**d)
+        if suspicious:
+            obj.suspicious_features = suspicious
+        return obj
 
 
 def load_target_configs() -> Dict[str, Dict]:
@@ -299,7 +336,12 @@ def prepare_features_and_target(
     
     all_columns = df.columns.tolist()
     # Use target-aware filtering to exclude temporal overlap features
-    safe_columns = filter_features_for_target(all_columns, target_column, verbose=False)
+    # Enable verbose logging to see what's being filtered
+    safe_columns = filter_features_for_target(all_columns, target_column, verbose=True)
+    
+    # Log filtering summary
+    excluded_count = len(all_columns) - len(safe_columns) - 1  # -1 for target itself
+    logger.info(f"  Filtered out {excluded_count} potentially leaking features (kept {len(safe_columns)} safe features)")
     
     # Keep only safe features + target
     safe_columns_with_target = safe_columns + [target_column]
@@ -365,14 +407,94 @@ def get_model_config(model_name: str, multi_model_config: Dict[str, Any]) -> Dic
     return config
 
 
+def _detect_leaking_features(
+    feature_names: List[str],
+    importances: np.ndarray,
+    model_name: str,
+    threshold: float = 0.50,
+    force_report: bool = False  # If True, always report top features even if no leak detected
+) -> List[Tuple[str, float]]:
+    """
+    Detect features with suspiciously high importance (likely data leakage).
+    
+    Returns list of (feature_name, importance) tuples for suspicious features.
+    """
+    if len(feature_names) != len(importances):
+        logger.warning(f"  Feature count mismatch: {len(feature_names)} names vs {len(importances)} importances")
+        return []
+    
+    # Normalize importances to sum to 1
+    total_importance = np.sum(importances)
+    if total_importance == 0:
+        logger.warning(f"  Total importance is zero for {model_name}")
+        return []
+    
+    normalized_importance = importances / total_importance
+    
+    # Create sorted list of (feature, importance) pairs
+    feature_imp_pairs = list(zip(feature_names, normalized_importance))
+    feature_imp_pairs.sort(key=lambda x: x[1], reverse=True)
+    
+    # Find features with importance above threshold
+    suspicious = []
+    for feat, imp in feature_imp_pairs:
+        if imp >= threshold:
+            suspicious.append((feat, float(imp)))
+            logger.error(
+                f"  🚨 LEAK DETECTED: {feat} has {imp:.1%} importance in {model_name} "
+                f"(threshold: {threshold:.1%}) - likely data leakage!"
+            )
+    
+    # Also check if top feature dominates (even if below threshold)
+    if len(normalized_importance) > 0:
+        top_feature, top_importance = feature_imp_pairs[0]
+        
+        # If top feature has >30% and is much larger than second, flag it
+        if top_importance >= 0.30 and len(feature_imp_pairs) > 1:
+            second_importance = feature_imp_pairs[1][1]
+            if top_importance > second_importance * 3:  # 3x larger than second
+                if (top_feature, top_importance) not in suspicious:
+                    suspicious.append((top_feature, float(top_importance)))
+                    logger.warning(
+                        f"  ⚠️  SUSPICIOUS: {top_feature} has {top_importance:.1%} importance "
+                        f"(3x larger than next feature: {feature_imp_pairs[1][0]}={second_importance:.1%}) - investigate for leakage"
+                    )
+    
+    # CRITICAL: If we suspect a leak (force_report=True) or found suspicious features,
+    # always print top 10 features to help identify the leak
+    if force_report or suspicious:
+        logger.error(f"  📊 TOP 10 FEATURES BY IMPORTANCE ({model_name}):")
+        logger.error(f"  {'='*70}")
+        for i, (feat, imp) in enumerate(feature_imp_pairs[:10], 1):
+            marker = "🚨" if (feat, imp) in suspicious else "  "
+            logger.error(f"    {marker} {i:2d}. {feat:50s} = {imp:.2%}")
+        
+        # Also check cumulative importance of top features
+        top_5_importance = sum(imp for _, imp in feature_imp_pairs[:5])
+        top_10_importance = sum(imp for _, imp in feature_imp_pairs[:10])
+        logger.error(f"  📈 Cumulative: Top 5 = {top_5_importance:.1%}, Top 10 = {top_10_importance:.1%}")
+        if top_5_importance > 0.80:
+            logger.error(f"  ⚠️  WARNING: Top 5 features account for {top_5_importance:.1%} of importance - likely leakage!")
+        
+        # Provide actionable next steps
+        logger.error(f"  💡 NEXT STEPS:")
+        logger.error(f"     1. Review the top features above - they likely contain future information")
+        logger.error(f"     2. Check feature importance CSV for full analysis")
+        logger.error(f"     3. Add leaking features to CONFIG/excluded_features.yaml")
+        logger.error(f"     4. Restart Python process and re-run to apply new filters")
+    
+    return suspicious
+
+
 def train_and_evaluate_models(
     X: np.ndarray,
     y: np.ndarray,
     feature_names: List[str],
     task_type: TaskType,
     model_families: List[str] = None,
-    multi_model_config: Dict[str, Any] = None
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float], float]:
+    multi_model_config: Dict[str, Any] = None,
+    target_column: str = None  # For leak reporting
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float], float, Dict[str, List[Tuple[str, float]]]]:
     """
     Train multiple models and return task-aware metrics + importance magnitude
     
@@ -391,10 +513,12 @@ def train_and_evaluate_models(
     
     Always returns 3 values, even on error (returns empty dicts and 0.0)
     """
-    # Initialize return values (ensures we always return 3 values)
+    # Initialize return values (ensures we always return 5 values)
     model_metrics = {}
     model_scores = {}
     importance_magnitudes = []
+    all_suspicious_features = {}  # {model_name: [(feature, importance), ...]}
+    all_feature_importances = {}  # {model_name: {feature: importance}} for detailed export
     
     try:
         from sklearn.model_selection import cross_val_score, TimeSeriesSplit
@@ -402,7 +526,7 @@ def train_and_evaluate_models(
         import lightgbm as lgb
     except Exception as e:
         logger.warning(f"Failed to import required libraries: {e}")
-        return {}, {}, 0.0
+        return {}, {}, 0.0, {}, {}, {}
     
     # Get CV config
     cv_config = multi_model_config.get('cross_validation', {}) if multi_model_config else {}
@@ -451,6 +575,33 @@ def train_and_evaluate_models(
     else:  # MULTICLASS_CLASSIFICATION
         scoring = 'accuracy'
     
+    # Helper function to detect perfect correlation (data leakage)
+    def _check_for_perfect_correlation(y_true: np.ndarray, y_pred: np.ndarray, model_name: str) -> bool:
+        """
+        Check if predictions are perfectly correlated with targets (indicates leakage).
+        Returns True if perfect correlation detected.
+        """
+        try:
+            # For classification, check if predictions match exactly
+            if task_type in {TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION}:
+                if len(y_true) == len(y_pred):
+                    accuracy = np.mean(y_true == y_pred)
+                    if accuracy >= 0.999:  # 99.9% accuracy = suspicious
+                        metric_name = "training accuracy"  # Clarify this is training, not CV
+                        logger.warning(f"  LEAKAGE WARNING: {model_name} has {accuracy:.1%} {metric_name} - likely data leakage!")
+                        return True
+            
+            # For regression, check correlation
+            elif task_type == TaskType.REGRESSION:
+                if len(y_true) == len(y_pred):
+                    corr = np.corrcoef(y_true, y_pred)[0, 1]
+                    if not np.isnan(corr) and abs(corr) >= 0.999:
+                        logger.warning(f"  LEAKAGE WARNING: {model_name} has correlation {corr:.4f} - likely data leakage!")
+                        return True
+        except Exception:
+            pass
+        return False
+    
     # Helper function to compute and store full task-aware metrics
     def _compute_and_store_metrics(model_name: str, model, X: np.ndarray, y: np.ndarray,
                                    primary_score: float, task_type: TaskType):
@@ -481,23 +632,34 @@ def train_and_evaluate_models(
         try:
             if task_type == TaskType.REGRESSION:
                 y_pred = model.predict(X)
+                # Check for perfect correlation (leakage)
+                if _check_for_perfect_correlation(y, y_pred, model_name):
+                    logger.error(f"  CRITICAL: {model_name} shows signs of data leakage! Check feature filtering.")
                 full_metrics = evaluate_by_task(task_type, y, y_pred, return_ic=True)
             elif task_type == TaskType.BINARY_CLASSIFICATION:
                 if hasattr(model, 'predict_proba'):
                     y_proba = model.predict_proba(X)[:, 1]  # Probability of class 1
+                    y_pred = (y_proba >= 0.5).astype(int)
                 else:
                     # Fallback for models without predict_proba
                     y_pred = model.predict(X)
                     y_proba = np.clip(y_pred, 0, 1)  # Assume predictions are probabilities
+                # Check for perfect correlation (leakage)
+                if _check_for_perfect_correlation(y, y_pred, model_name):
+                    logger.error(f"  CRITICAL: {model_name} shows signs of data leakage! Check feature filtering.")
                 full_metrics = evaluate_by_task(task_type, y, y_proba)
             else:  # MULTICLASS_CLASSIFICATION
                 if hasattr(model, 'predict_proba'):
                     y_proba = model.predict_proba(X)
+                    y_pred = y_proba.argmax(axis=1)
                 else:
                     # Fallback: one-hot encode predictions
                     y_pred = model.predict(X)
                     n_classes = len(np.unique(y[~np.isnan(y)]))
                     y_proba = np.eye(n_classes)[y_pred.astype(int)]
+                # Check for perfect correlation (leakage)
+                if _check_for_perfect_correlation(y, y_pred, model_name):
+                    logger.error(f"  CRITICAL: {model_name} shows signs of data leakage! Check feature filtering.")
                 full_metrics = evaluate_by_task(task_type, y, y_proba)
             
             # Store full metrics
@@ -532,7 +694,7 @@ def train_and_evaluate_models(
         min_class_count = class_counts[class_counts > 0].min()
         if min_class_count < 2:
             logger.debug(f"    Skipping: Smallest class has only {min_class_count} sample(s)")
-            return {}, {}, 0.0  # model_metrics, model_scores, mean_importance
+            return {}, {}, 0.0, {}, {}  # model_metrics, model_scores, mean_importance, suspicious_features, feature_importances
     
     # LightGBM
     if 'lightgbm' in model_families:
@@ -591,10 +753,39 @@ def train_and_evaluate_models(
             # Train once to get importance and full metrics
             model.fit(X, y)
             
+            # CRITICAL: Check for suspiciously high scores (likely leakage)
+            has_leak = False
+            if not np.isnan(primary_score) and primary_score >= 0.99:
+                # Use task-appropriate metric name
+                if task_type == TaskType.REGRESSION:
+                    metric_name = "R²"
+                elif task_type == TaskType.BINARY_CLASSIFICATION:
+                    metric_name = "ROC-AUC"
+                else:
+                    metric_name = "Accuracy"
+                logger.error(f"  🚨 LEAKAGE ALERT: lightgbm {metric_name}={primary_score:.4f} >= 0.99 - likely data leakage!")
+                logger.error(f"    Features: {len(feature_names)} features")
+                logger.error(f"    Analyzing feature importances to identify leaks...")
+                has_leak = True
+            
+            # LEAK DETECTION: Analyze feature importance for suspicious patterns
+            importances = model.feature_importances_
+            suspicious_features = _detect_leaking_features(
+                feature_names, importances, model_name='lightgbm',
+                threshold=0.50,  # Flag if single feature has >50% importance
+                force_report=has_leak  # Always report top features if score indicates leak
+            )
+            if suspicious_features:
+                all_suspicious_features['lightgbm'] = suspicious_features
+            
+            # Store all feature importances for detailed export
+            all_feature_importances['lightgbm'] = {
+                feat: float(imp) for feat, imp in zip(feature_names, importances)
+            }
+            
             # Compute and store full task-aware metrics
             _compute_and_store_metrics('lightgbm', model, X, y, primary_score, task_type)
             # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
-            importances = model.feature_importances_
             total_importance = np.sum(importances)
             if total_importance > 0:
                 top_k = max(1, int(len(importances) * 0.1))  # Top 10% of features
@@ -627,10 +818,26 @@ def train_and_evaluate_models(
             
             model.fit(X, y)
             
+            # Check for suspicious scores
+            has_leak = not np.isnan(primary_score) and primary_score >= 0.99
+            
+            # LEAK DETECTION: Analyze feature importance
+            importances = model.feature_importances_
+            suspicious_features = _detect_leaking_features(
+                feature_names, importances, model_name='random_forest', 
+                threshold=0.50, force_report=has_leak
+            )
+            if suspicious_features:
+                all_suspicious_features['random_forest'] = suspicious_features
+            
+            # Store all feature importances for detailed export
+            all_feature_importances['random_forest'] = {
+                feat: float(imp) for feat, imp in zip(feature_names, importances)
+            }
+            
             # Compute and store full task-aware metrics
             _compute_and_store_metrics('random_forest', model, X, y, primary_score, task_type)
             # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
-            importances = model.feature_importances_
             total_importance = np.sum(importances)
             if total_importance > 0:
                 top_k = max(1, int(len(importances) * 0.1))  # Top 10% of features
@@ -653,27 +860,30 @@ def train_and_evaluate_models(
             from sklearn.compose import TransformedTargetRegressor
             from sklearn.pipeline import Pipeline
             
-            # Handle NaN values (neural networks can't handle them)
-            imputer = SimpleImputer(strategy='median')
-            X_imputed = imputer.fit_transform(X)
-            
-            # Scale for NN
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_imputed)
-            
             # Get config values
             nn_config = get_model_config('neural_network', multi_model_config)
             
             if is_binary or is_multiclass:
-                model = MLPClassifier(**nn_config)
-                # For classification, no target scaling needed
+                # For classification: Pipeline handles imputation and scaling within CV folds
+                steps = [
+                    ('imputer', SimpleImputer(strategy='median')),
+                    ('scaler', StandardScaler()),
+                    ('model', MLPClassifier(**nn_config))
+                ]
+                pipeline = Pipeline(steps)
+                model = pipeline
                 y_for_training = y
             else:
-                # For regression: use TransformedTargetRegressor to scale target within CV folds
-                # This ensures no data leakage - scaler is fit only on training data in each fold
-                base_model = MLPRegressor(**nn_config)
+                # For regression: Pipeline for features + TransformedTargetRegressor for target
+                # This ensures no data leakage - all scaling/imputation happens within CV folds
+                feature_steps = [
+                    ('imputer', SimpleImputer(strategy='median')),
+                    ('scaler', StandardScaler()),
+                    ('model', MLPRegressor(**nn_config))
+                ]
+                feature_pipeline = Pipeline(feature_steps)
                 model = TransformedTargetRegressor(
-                    regressor=base_model,
+                    regressor=feature_pipeline,
                     transformer=StandardScaler()
                 )
                 y_for_training = y
@@ -683,8 +893,8 @@ def train_and_evaluate_models(
             with warnings.catch_warnings():
                 warnings.filterwarnings('ignore', category=ConvergenceWarning)
                 try:
-                    # TransformedTargetRegressor handles scaling within each CV fold (no leakage)
-                    scores = cross_val_score(model, X_scaled, y_for_training, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
+                    # Pipeline ensures imputation/scaling happens within each CV fold (no leakage)
+                    scores = cross_val_score(model, X, y_for_training, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
                     valid_scores = scores[~np.isnan(scores)]
                     primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
                 except ValueError as e:
@@ -696,18 +906,18 @@ def train_and_evaluate_models(
                     else:
                         raise
             
-            # Fit on scaled data (TransformedTargetRegressor handles target scaling internally)
+            # Fit on raw data (Pipeline handles preprocessing internally)
             if not np.isnan(primary_score):
-                model.fit(X_scaled, y_for_training)
+                model.fit(X, y_for_training)
                 
-                # Compute and store full task-aware metrics (use scaled X for predictions)
-                _compute_and_store_metrics('neural_network', model, X_scaled, y_for_training, primary_score, task_type)
+                # Compute and store full task-aware metrics (Pipeline handles preprocessing)
+                _compute_and_store_metrics('neural_network', model, X, y_for_training, primary_score, task_type)
             
-            baseline_score = model.score(X_scaled, y_for_training)
+            baseline_score = model.score(X, y_for_training)
             
             perm_scores = []
             for i in range(min(10, X.shape[1])):  # Sample 10 features
-                X_perm = X_scaled.copy()
+                X_perm = X.copy()
                 np.random.shuffle(X_perm[:, i])
                 perm_score = model.score(X_perm, y_for_training)
                 perm_scores.append(abs(baseline_score - perm_score))
@@ -766,8 +976,26 @@ def train_and_evaluate_models(
             if not np.isnan(primary_score):
                 model.fit(X, y)
                 
+                # Check for suspicious scores
+                has_leak = primary_score >= 0.99
+                
                 # Compute and store full task-aware metrics
                 _compute_and_store_metrics('xgboost', model, X, y, primary_score, task_type)
+                
+                # LEAK DETECTION: Analyze feature importance
+                if hasattr(model, 'feature_importances_'):
+                    importances = model.feature_importances_
+                    suspicious_features = _detect_leaking_features(
+                        feature_names, importances, model_name='xgboost', 
+                        threshold=0.50, force_report=has_leak
+                    )
+                    if suspicious_features:
+                        all_suspicious_features['xgboost'] = suspicious_features
+                    
+                    # Store all feature importances for detailed export
+                    all_feature_importances['xgboost'] = {
+                        feat: float(imp) for feat, imp in zip(feature_names, importances)
+                    }
             if hasattr(model, 'feature_importances_'):
                 # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
                 importances = model.feature_importances_
@@ -844,24 +1072,30 @@ def train_and_evaluate_models(
         try:
             from sklearn.linear_model import Lasso
             from sklearn.impute import SimpleImputer
-            
-            # Lasso doesn't handle NaN - need to impute
-            imputer = SimpleImputer(strategy='median')
-            X_imputed = imputer.fit_transform(X)
+            from sklearn.pipeline import Pipeline
             
             # Get config values
             lasso_config = get_model_config('lasso', multi_model_config)
             
-            model = Lasso(**lasso_config)
-            scores = cross_val_score(model, X_imputed, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
+            # Pipeline ensures imputation happens within each CV fold (no leakage)
+            steps = [
+                ('imputer', SimpleImputer(strategy='median')),
+                ('model', Lasso(**lasso_config))
+            ]
+            pipeline = Pipeline(steps)
+            
+            scores = cross_val_score(pipeline, X, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
             valid_scores = scores[~np.isnan(scores)]
             primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
-            model.fit(X_imputed, y)
+            pipeline.fit(X, y)
             
             # Compute and store full task-aware metrics (Lasso is regression-only)
             if not np.isnan(primary_score) and task_type == TaskType.REGRESSION:
-                _compute_and_store_metrics('lasso', model, X_imputed, y, primary_score, task_type)
+                _compute_and_store_metrics('lasso', pipeline, X, y, primary_score, task_type)
+            
+            # Extract coefficients from the fitted model
+            model = pipeline.named_steps['model']
             importance = np.abs(model.coef_)
             if len(importance) > 0:
                 total_importance = np.sum(importance)
@@ -1232,15 +1466,113 @@ def train_and_evaluate_models(
     
     # model_scores already contains primary scores (backward compatible)
     # model_metrics contains full metrics dict
-    return model_metrics, model_scores, mean_importance
+    # all_suspicious_features contains leak detection results (aggregated across all models)
+    # all_feature_importances contains detailed per-feature importances for export
+    return model_metrics, model_scores, mean_importance, all_suspicious_features, all_feature_importances
+
+
+def _save_feature_importances(
+    target_column: str,
+    symbol: str,
+    feature_importances: Dict[str, Dict[str, float]],
+    output_dir: Path = None
+) -> None:
+    """
+    Save detailed per-model, per-feature importance scores to CSV files.
+    
+    Creates structure:
+    {output_dir}/feature_importances/
+      {target_name}/
+        {symbol}/
+          lightgbm_importances.csv
+          xgboost_importances.csv
+          random_forest_importances.csv
+          ...
+    
+    Args:
+        target_column: Name of the target being evaluated
+        symbol: Symbol being evaluated
+        feature_importances: Dict of {model_name: {feature: importance}}
+        output_dir: Base output directory (defaults to results/)
+    """
+    if output_dir is None:
+        output_dir = _REPO_ROOT / "results"
+    
+    # Create directory structure
+    target_name_clean = target_column.replace('/', '_').replace('\\', '_')
+    importances_dir = output_dir / "feature_importances" / target_name_clean / symbol
+    importances_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save per-model CSV files
+    for model_name, importances in feature_importances.items():
+        if not importances:
+            continue
+        
+        # Create DataFrame sorted by importance
+        df = pd.DataFrame([
+            {'feature': feat, 'importance': imp}
+            for feat, imp in importances.items()
+        ])
+        df = df.sort_values('importance', ascending=False)
+        
+        # Normalize to percentages
+        total = df['importance'].sum()
+        if total > 0:
+            df['importance_pct'] = (df['importance'] / total * 100).round(2)
+            df['cumulative_pct'] = df['importance_pct'].cumsum().round(2)
+        else:
+            df['importance_pct'] = 0.0
+            df['cumulative_pct'] = 0.0
+        
+        # Reorder columns
+        df = df[['feature', 'importance', 'importance_pct', 'cumulative_pct']]
+        
+        # Save to CSV
+        csv_file = importances_dir / f"{model_name}_importances.csv"
+        df.to_csv(csv_file, index=False)
+    
+    logger.info(f"  💾 Saved feature importances to: {importances_dir}")
+
+
+def _log_suspicious_features(
+    target_column: str,
+    symbol: str,
+    suspicious_features: Dict[str, List[Tuple[str, float]]]
+) -> None:
+    """
+    Log suspicious features to a file for later analysis.
+    
+    Args:
+        target_column: Name of the target being evaluated
+        symbol: Symbol being evaluated
+        suspicious_features: Dict of {model_name: [(feature, importance), ...]}
+    """
+    leak_report_file = _REPO_ROOT / "results" / "leak_detection_report.txt"
+    leak_report_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(leak_report_file, 'a') as f:
+        f.write(f"\n{'='*80}\n")
+        f.write(f"Target: {target_column} | Symbol: {symbol}\n")
+        f.write(f"{'='*80}\n")
+        
+        for model_name, features in suspicious_features.items():
+            if features:
+                f.write(f"\n{model_name.upper()} - Suspicious Features:\n")
+                f.write(f"{'-'*80}\n")
+                for feat, imp in sorted(features, key=lambda x: x[1], reverse=True):
+                    f.write(f"  {feat:50s} | Importance: {imp:.1%}\n")
+                f.write("\n")
+    
+    logger.info(f"  Leak detection report saved to: {leak_report_file}")
 
 
 def detect_leakage(
-    mean_r2: float,
+    mean_score: float,
     composite_score: float,
     mean_importance: float,
     target_name: str = "",
-    model_scores: Dict[str, float] = None
+    model_scores: Dict[str, float] = None,
+    task_type: TaskType = TaskType.REGRESSION
 ) -> str:
     """
     Detect potential data leakage based on suspicious patterns.
@@ -1253,59 +1585,72 @@ def detect_leakage(
     """
     flags = []
     
-    # Determine threshold based on target type
-    # Forward returns should have lower R² than barrier targets
-    is_forward_return = target_name.startswith('fwd_ret_')
+    # Determine threshold based on task type and target name
+    if task_type == TaskType.REGRESSION:
+        is_forward_return = target_name.startswith('fwd_ret_')
+        if is_forward_return:
+            # For forward returns: R² > 0.50 is suspicious
+            high_threshold = 0.50
+            very_high_threshold = 0.60
+            metric_name = "R²"
+        else:
+            # For barrier targets: R² > 0.70 is suspicious
+            high_threshold = 0.70
+            very_high_threshold = 0.80
+            metric_name = "R²"
+    elif task_type == TaskType.BINARY_CLASSIFICATION:
+        # ROC-AUC > 0.95 is suspicious (near-perfect classification)
+        high_threshold = 0.90
+        very_high_threshold = 0.95
+        metric_name = "ROC-AUC"
+    else:  # MULTICLASS_CLASSIFICATION
+        # Accuracy > 0.95 is suspicious
+        high_threshold = 0.90
+        very_high_threshold = 0.95
+        metric_name = "Accuracy"
     
-    if is_forward_return:
-        # For forward returns: R² > 0.50 is suspicious (very hard to predict)
-        high_r2_threshold = 0.50
-        very_high_r2_threshold = 0.60
-    else:
-        # For barrier targets: R² > 0.70 is suspicious (per leakage.md)
-        high_r2_threshold = 0.70
-        very_high_r2_threshold = 0.80
-    
-    # Check 1: Suspiciously high mean R²
-    if mean_r2 > very_high_r2_threshold:
-        flags.append("HIGH_R2")
+    # Check 1: Suspiciously high mean score
+    if mean_score > very_high_threshold:
+        flags.append("HIGH_SCORE")
         logger.warning(
-            f"LEAKAGE WARNING: R²={mean_r2:.3f} > {very_high_r2_threshold:.2f} "
+            f"LEAKAGE WARNING: {metric_name}={mean_score:.3f} > {very_high_threshold:.2f} "
             f"(extremely high - likely leakage)"
         )
-    elif mean_r2 > high_r2_threshold:
-        flags.append("HIGH_R2")
+    elif mean_score > high_threshold:
+        flags.append("HIGH_SCORE")
         logger.warning(
-            f"LEAKAGE WARNING: R²={mean_r2:.3f} > {high_r2_threshold:.2f} "
+            f"LEAKAGE WARNING: {metric_name}={mean_score:.3f} > {high_threshold:.2f} "
             f"(suspiciously high - investigate)"
         )
     
     # Check 2: Individual model scores too high (even if mean is lower)
     if model_scores:
         high_model_count = sum(1 for score in model_scores.values() 
-                              if not np.isnan(score) and score > high_r2_threshold)
-        if high_model_count >= 3:  # 3+ models with high R²
-            flags.append("HIGH_R2")
+                              if not np.isnan(score) and score > high_threshold)
+        if high_model_count >= 3:  # 3+ models with high scores
+            flags.append("HIGH_SCORE")
             logger.warning(
-                f"LEAKAGE WARNING: {high_model_count} models have R² > {high_r2_threshold:.2f} "
-                f"(models: {[k for k, v in model_scores.items() if not np.isnan(v) and v > high_r2_threshold]})"
+                f"LEAKAGE WARNING: {high_model_count} models have {metric_name} > {high_threshold:.2f} "
+                f"(models: {[k for k, v in model_scores.items() if not np.isnan(v) and v > high_threshold]})"
             )
     
-    # Check 3: Composite score inconsistent with R²
-    # If composite is very high (> 0.5) but R² is low (< 0.2), something's wrong
-    if composite_score > 0.5 and mean_r2 < 0.2:
+    # Check 3: Composite score inconsistent with mean score
+    # If composite is very high (> 0.5) but score is low (< 0.2 for regression, < 0.6 for classification), something's wrong
+    score_low_threshold = 0.2 if task_type == TaskType.REGRESSION else 0.6
+    if composite_score > 0.5 and mean_score < score_low_threshold:
         flags.append("INCONSISTENT")
         logger.warning(
-            f"LEAKAGE WARNING: Composite={composite_score:.3f} but R²={mean_r2:.3f} "
+            f"LEAKAGE WARNING: Composite={composite_score:.3f} but {metric_name}={mean_score:.3f} "
             f"(inconsistent - possible leakage)"
         )
     
-    # Check 4: Very high importance with low R² (might indicate leaked features)
-    if mean_importance > 0.7 and mean_r2 < 0.1:
+    # Check 4: Very high importance with low score (might indicate leaked features)
+    score_very_low_threshold = 0.1 if task_type == TaskType.REGRESSION else 0.5
+    if mean_importance > 0.7 and mean_score < score_very_low_threshold:
         flags.append("INCONSISTENT")
         logger.warning(
-            f"LEAKAGE WARNING: Importance={mean_importance:.2f} but R²={mean_r2:.3f} "
-            f"(high importance with low R² - check for leaked features)"
+            f"LEAKAGE WARNING: Importance={mean_importance:.2f} but {metric_name}={mean_score:.3f} "
+            f"(high importance with low {metric_name} - check for leaked features)"
         )
     
     if len(flags) > 1:
@@ -1317,44 +1662,47 @@ def detect_leakage(
 
 
 def calculate_composite_score(
-    mean_r2: float,
-    std_r2: float,
+    mean_score: float,
+    std_score: float,
     mean_importance: float,
-    n_models: int
+    n_models: int,
+    task_type: TaskType = TaskType.REGRESSION
 ) -> float:
     """
     Calculate composite predictability score
     
     Components:
-    - Mean R²: Higher is better (0-1)
+    - Mean score: Higher is better (R² for regression, ROC-AUC/Accuracy for classification)
     - Consistency: Lower std is better
     - Importance magnitude: Higher is better
     - Model agreement: More models = more confidence
     """
     
-    # Normalize components
-    r2_component = max(0, mean_r2)  # 0-1
-    consistency_component = 1.0 / (1.0 + std_r2)  # Higher when std is low
-    
-    # R²-weighted importance: Scale importance by R², but don't penalize too harshly
-    # Good targets (R²=0.2): importance * 1.2 = boosted
-    # Poor targets (R²=-0.45): importance * 0.7 = moderately penalized (still some value)
-    # Very poor (R²<-0.5): importance * 0.5 = heavily penalized
-    # This creates a bigger gap while acknowledging negative R² might still have signal
-    if mean_r2 > 0:
-        # Positive R²: boost proportionally (R²=0.2 → 1.2x, R²=0.5 → 1.5x)
-        importance_component = mean_importance * (1.0 + mean_r2)
+    # Normalize components based on task type
+    if task_type == TaskType.REGRESSION:
+        # R² can be negative, so normalize to 0-1 range
+        score_component = max(0, mean_score)  # Clamp negative R² to 0
+        consistency_component = 1.0 / (1.0 + std_score)
+        
+        # R²-weighted importance
+        if mean_score > 0:
+            importance_component = mean_importance * (1.0 + mean_score)
+        else:
+            penalty = abs(mean_score) * 0.67
+            importance_component = mean_importance * max(0.5, 1.0 - penalty)
     else:
-        # Negative R²: soft penalty (R²=-0.2 → 0.8x, R²=-0.45 → 0.7x, R²=-0.6 → 0.6x)
-        # Don't go below 0.5x to preserve some signal even for poor targets
-        penalty = abs(mean_r2) * 0.67  # Softer penalty (max 0.67x reduction at R²=-1.0)
-        importance_component = mean_importance * max(0.5, 1.0 - penalty)
+        # Classification: ROC-AUC and Accuracy are already 0-1
+        score_component = mean_score  # Already 0-1
+        consistency_component = 1.0 / (1.0 + std_score)
+        
+        # Score-weighted importance (similar logic but for 0-1 scores)
+        importance_component = mean_importance * (1.0 + mean_score)
     
     # Weighted average
     composite = (
-        0.50 * r2_component +        # 50% weight on R²
+        0.50 * score_component +        # 50% weight on score
         0.25 * consistency_component + # 25% on consistency
-        0.25 * importance_component    # 25% on R²-weighted importance
+        0.25 * importance_component    # 25% on score-weighted importance
     )
     
     # Bonus for more models (up to 10% boost)
@@ -1370,7 +1718,8 @@ def evaluate_target_predictability(
     symbols: List[str],
     data_dir: Path,
     model_families: List[str],
-    multi_model_config: Dict[str, Any] = None
+    multi_model_config: Dict[str, Any] = None,
+    output_dir: Path = None
 ) -> TargetPredictabilityScore:
     """Evaluate predictability of a single target across symbols"""
     
@@ -1398,6 +1747,7 @@ def evaluate_target_predictability(
     
     all_model_scores = []
     all_importances = []
+    all_suspicious_features = {}  # Aggregate suspicious features across symbols
     
     for symbol in symbols:
         try:
@@ -1435,14 +1785,49 @@ def evaluate_target_predictability(
             # Train and evaluate (with task type)
             try:
                 result = train_and_evaluate_models(
-                    X, y, feature_names, task_type, model_families, multi_model_config
+                    X, y, feature_names, task_type, model_families, multi_model_config,
+                    target_column=target_column
                 )
-                # Ensure we got 3 values (handle case where function returns None or wrong number)
-                if result is None or len(result) != 3:
+                # Ensure we got 5 values (handle case where function returns None or wrong number)
+                if result is None or len(result) != 5:
                     logger.warning(f"train_and_evaluate_models returned unexpected value: {result}")
                     continue
                 
-                model_metrics, primary_scores, importance = result
+                model_metrics, primary_scores, importance, suspicious_features, feature_importances = result
+                
+                # Save detailed feature importances to file (per symbol)
+                if feature_importances:
+                    _save_feature_importances(target_column, symbol, feature_importances, output_dir)
+                
+                # Aggregate feature importances across symbols (for averaging)
+                if not hasattr(evaluate_target_predictability, '_all_feature_importances_agg'):
+                    evaluate_target_predictability._all_feature_importances_agg = {}
+                for model_name, importances in feature_importances.items():
+                    if model_name not in evaluate_target_predictability._all_feature_importances_agg:
+                        evaluate_target_predictability._all_feature_importances_agg[model_name] = {}
+                    for feat, imp in importances.items():
+                        if feat not in evaluate_target_predictability._all_feature_importances_agg[model_name]:
+                            evaluate_target_predictability._all_feature_importances_agg[model_name][feat] = []
+                        evaluate_target_predictability._all_feature_importances_agg[model_name][feat].append(imp)
+                
+                # Aggregate suspicious features across symbols
+                if suspicious_features:
+                    for model_name, features in suspicious_features.items():
+                        if model_name not in all_suspicious_features:
+                            all_suspicious_features[model_name] = []
+                        # Merge features, keeping max importance if duplicate
+                        existing_features = {f[0]: f[1] for f in all_suspicious_features[model_name]}
+                        for feat, imp in features:
+                            if feat in existing_features:
+                                existing_features[feat] = max(existing_features[feat], imp)
+                            else:
+                                existing_features[feat] = imp
+                        all_suspicious_features[model_name] = [
+                            (f, imp) for f, imp in existing_features.items()
+                        ]
+                    
+                    # Log and save suspicious features
+                    _log_suspicious_features(target_column, symbol, suspicious_features)
                 
                 # Convert to old format for backward compatibility
                 # Ensure primary_scores is a dict (handle early returns or errors)
@@ -1489,8 +1874,9 @@ def evaluate_target_predictability(
         return TargetPredictabilityScore(
             target_name=target_name,
             target_column=target_column,
-            mean_r2=-999.0,  # Flag for degenerate/failed targets
-            std_r2=1.0,
+            task_type=TaskType.REGRESSION,  # Default, will be updated if target succeeds
+            mean_score=-999.0,  # Flag for degenerate/failed targets
+            std_score=1.0,
             mean_importance=0.0,
             consistency=0.0,
             n_models=0,
@@ -1515,48 +1901,134 @@ def evaluate_target_predictability(
         return TargetPredictabilityScore(
             target_name=target_name,
             target_column=target_column,
-            mean_r2=-999.0,
-            std_r2=1.0,
+            task_type=TaskType.REGRESSION,  # Default
+            mean_score=-999.0,
+            std_score=1.0,
             mean_importance=0.0,
             consistency=0.0,
             n_models=0,
             model_scores={},
-            leakage_flag="OK"
+            leakage_flag="OK",
+            suspicious_features=None
         )
     
-    mean_r2 = np.mean(list(model_means.values()))
-    std_r2 = np.std(list(model_means.values())) if len(model_means) > 1 else 0.0
+    mean_score = np.mean(list(model_means.values()))
+    std_score = np.std(list(model_means.values())) if len(model_means) > 1 else 0.0
     mean_importance = np.mean(all_importances)
-    consistency = 1.0 - (std_r2 / (abs(mean_r2) + 1e-6))
+    consistency = 1.0 - (std_score / (abs(mean_score) + 1e-6))
     
-    # Composite score
+    # Determine task type from target config (should be consistent across symbols)
+    # Use the task_type from the first successful evaluation
+    final_task_type = target_config_obj.task_type if hasattr(target_config_obj, 'task_type') else TaskType.REGRESSION
+    
+    # Get metric name for logging
+    if final_task_type == TaskType.REGRESSION:
+        metric_name = "R²"
+    elif final_task_type == TaskType.BINARY_CLASSIFICATION:
+        metric_name = "ROC-AUC"
+    else:  # MULTICLASS_CLASSIFICATION
+        metric_name = "Accuracy"
+    
+    # Composite score (normalize scores appropriately)
     composite = calculate_composite_score(
-        mean_r2, std_r2, mean_importance, len(all_scores_by_model)
+        mean_score, std_score, mean_importance, len(all_scores_by_model), final_task_type
     )
     
-    # Detect potential leakage
-    leakage_flag = detect_leakage(mean_r2, composite, mean_importance, 
-                                  target_name=target_name, model_scores=model_means)
+    # Detect potential leakage (use task-appropriate thresholds)
+    leakage_flag = detect_leakage(mean_score, composite, mean_importance, 
+                                  target_name=target_name, model_scores=model_means, task_type=final_task_type)
     
     result = TargetPredictabilityScore(
         target_name=target_name,
         target_column=target_column,
-        mean_r2=mean_r2,
-        std_r2=std_r2,
+        task_type=final_task_type,
+        mean_score=mean_score,
+        std_score=std_score,
         mean_importance=mean_importance,
         consistency=consistency,
         n_models=len(all_scores_by_model),
         model_scores=model_means,
         composite_score=composite,
-        leakage_flag=leakage_flag
+        leakage_flag=leakage_flag,
+        suspicious_features=all_suspicious_features if all_suspicious_features else None
     )
     
     # Log with leakage warning if needed
     leakage_indicator = f" [{leakage_flag}]" if leakage_flag != "OK" else ""
-    logger.info(f"Summary: R²={mean_r2:.3f}±{std_r2:.3f}, "
+    logger.info(f"Summary: {metric_name}={mean_score:.3f}±{std_score:.3f}, "
                f"importance={mean_importance:.2f}, composite={composite:.3f}{leakage_indicator}")
     
+    # Store suspicious features in result for summary report
+    result.suspicious_features = all_suspicious_features if all_suspicious_features else None
+    
+    # Save aggregated feature importances (averaged across symbols)
+    if hasattr(evaluate_target_predictability, '_all_feature_importances_agg'):
+        agg_importances = evaluate_target_predictability._all_feature_importances_agg
+        if agg_importances:
+            # Calculate averages
+            avg_importances = {}
+            for model_name, feat_imps in agg_importances.items():
+                avg_importances[model_name] = {
+                    feat: float(np.mean(imps))
+                    for feat, imps in feat_imps.items()
+                }
+            
+            # Save to aggregated file
+            if output_dir:
+                _save_feature_importances(target_column, "AGGREGATED", avg_importances, output_dir)
+    
     return result
+
+
+def save_leak_report_summary(
+    output_dir: Path,
+    all_leaks: Dict[str, Dict[str, List[Tuple[str, float]]]]
+) -> None:
+    """
+    Save a summary of all detected leaks across all targets.
+    
+    Args:
+        output_dir: Directory to save the report
+        all_leaks: Dict of {target_name: {model_name: [(feature, importance), ...]}}
+    """
+    report_file = output_dir / "leak_detection_summary.txt"
+    
+    with open(report_file, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("LEAK DETECTION SUMMARY\n")
+        f.write("="*80 + "\n\n")
+        f.write("This report lists features with suspiciously high importance (>50%)\n")
+        f.write("which may indicate data leakage (future information in features).\n\n")
+        
+        total_leaks = sum(len(leaks) for leaks in all_leaks.values())
+        f.write(f"Total targets with suspicious features: {len(all_leaks)}\n")
+        f.write(f"Total suspicious feature detections: {total_leaks}\n\n")
+        
+        for target_name, model_leaks in sorted(all_leaks.items()):
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Target: {target_name}\n")
+            f.write(f"{'='*80}\n")
+            
+            for model_name, features in model_leaks.items():
+                if features:
+                    f.write(f"\n{model_name.upper()}:\n")
+                    f.write(f"{'-'*80}\n")
+                    for feat, imp in sorted(features, key=lambda x: x[1], reverse=True):
+                        f.write(f"  {feat:60s} | {imp:.1%}\n")
+        
+        f.write(f"\n\n{'='*80}\n")
+        f.write("RECOMMENDATIONS:\n")
+        f.write(f"{'='*80}\n")
+        f.write("1. Review features with >50% importance - they likely contain future information\n")
+        f.write("2. Check for:\n")
+        f.write("   - Centered moving averages (center=True)\n")
+        f.write("   - Backward shifts (.shift(-1) instead of .shift(1))\n")
+        f.write("   - High/Low data that matches target definition\n")
+        f.write("   - Features computed from the same barrier logic as the target\n")
+        f.write("3. Add suspicious features to leakage_filtering.py exclusion list\n")
+        f.write("4. Re-run ranking after fixing leaks\n")
+    
+    logger.info(f"Leak detection summary saved to: {report_file}")
 
 
 def save_rankings(
@@ -1575,8 +2047,11 @@ def save_rankings(
         'target_name': r.target_name,
         'target_column': r.target_column,
         'composite_score': r.composite_score,
-        'mean_r2': r.mean_r2,
-        'std_r2': r.std_r2,
+        'task_type': r.task_type.name,
+        'mean_score': r.mean_score,
+        'std_score': r.std_score,
+        'mean_r2': r.mean_score,  # Backward compatibility
+        'std_r2': r.std_score,  # Backward compatibility
         'mean_importance': r.mean_importance,
         'consistency': r.consistency,
         'n_models': r.n_models,
@@ -1607,7 +2082,9 @@ def save_rankings(
             'rank': i + 1,
             'target': r.target_name,
             'composite_score': float(r.composite_score),
-            'mean_r2': float(r.mean_r2),
+            'task_type': r.task_type.name,
+            'mean_score': float(r.mean_score),
+            'mean_r2': float(r.mean_score),  # Backward compatibility
             'leakage_flag': r.leakage_flag,
             'recommendation': _get_recommendation(r)
             }
@@ -1756,14 +2233,15 @@ def main():
         logger.info(f"[{idx}/{total_targets}] Evaluating {target_name}...")
         try:
             result = evaluate_target_predictability(
-                target_name, target_config, symbols, args.data_dir, model_families, multi_model_config
+                target_name, target_config, symbols, args.data_dir, model_families, multi_model_config,
+                output_dir=args.output_dir
             )
             
             # Save checkpoint after each target
             checkpoint.save_item(target_name, result.to_dict())
             
-            # Skip degenerate targets (marked with mean_r2 = -999)
-            if result.mean_r2 != -999.0:
+            # Skip degenerate targets (marked with mean_score = -999)
+            if result.mean_score != -999.0:
                 results.append(result)
                 completed_count += 1
             else:
@@ -1800,7 +2278,14 @@ def main():
     for i, result in enumerate(all_results, 1):
         leakage_indicator = f" [{result.leakage_flag}]" if result.leakage_flag != "OK" else ""
         logger.info(f"\n{i:2d}. {result.target_name:25s} | Score: {result.composite_score:.3f}{leakage_indicator}")
-        logger.info(f"    R²: {result.mean_r2:.3f} ± {result.std_r2:.3f}")
+        # Use task-appropriate metric name
+        if result.task_type == TaskType.REGRESSION:
+            metric_name = "R²"
+        elif result.task_type == TaskType.BINARY_CLASSIFICATION:
+            metric_name = "ROC-AUC"
+        else:
+            metric_name = "Accuracy"
+        logger.info(f"    {metric_name}: {result.mean_score:.3f} ± {result.std_score:.3f}")
         logger.info(f"    Importance: {result.mean_importance:.2f}")
         logger.info(f"    Recommendation: {_get_recommendation(result)}")
         if result.leakage_flag != "OK":
