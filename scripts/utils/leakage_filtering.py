@@ -1,439 +1,250 @@
 """
-Target-Aware Leakage Filtering Utilities
+Target-Aware Leakage Filtering
 
-Provides reusable functions for filtering features based on target horizon
-to prevent temporal overlap leakage.
+Filters out features that would leak information about the target being predicted.
+Uses temporal awareness: features computed at time t cannot use information from
+time t+horizon or later.
 """
 
 import re
-from pathlib import Path
-from typing import List, Set, Optional, Dict
-import yaml
+from typing import List, Set, Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
-
-def load_exclusion_config(config_path: Path = None) -> dict:
-    """Load feature exclusion configuration"""
-    if config_path is None:
-        config_path = _REPO_ROOT / "CONFIG" / "excluded_features.yaml"
-    
-    if not config_path.exists():
-        logger.warning(f"Exclusion config not found: {config_path}")
-        return {}
-    
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def extract_target_horizon(target_name: str) -> Optional[Dict[str, any]]:
+def filter_features_for_target(
+    all_columns: List[str],
+    target_column: str,
+    verbose: bool = False
+) -> List[str]:
     """
-    Extract horizon information from target name.
+    Filter features that would leak information about the target.
     
-    Examples:
-        fwd_ret_20d -> {'value': 20, 'unit': 'd', 'minutes': 20*1440}
-        fwd_ret_60m -> {'value': 60, 'unit': 'm', 'minutes': 60}
-        fwd_ret_oc_same_day -> {'value': 1, 'unit': 'd', 'minutes': 1440}
-        peak_60m_0.8 -> {'value': 60, 'unit': 'm', 'minutes': 60}
-        y_will_peak_60m_0.8 -> {'value': 60, 'unit': 'm', 'minutes': 60}
-        y_will_peak_mfe_10m_0.001 -> {'value': 10, 'unit': 'm', 'minutes': 10}
+    Uses target-aware filtering:
+    - For forward return targets (fwd_ret_*), exclude features computed from
+      future returns or overlapping time windows
+    - For barrier targets (y_will_*), exclude features that know about barrier
+      hits (tth_*, mfe_share_*, hit_direction_*, etc.)
+    
+    Args:
+        all_columns: List of all column names in the dataset
+        target_column: Name of the target column being predicted
+        verbose: If True, log excluded features
     
     Returns:
-        Dict with 'value', 'unit', 'minutes' or None if can't parse
+        List of safe feature column names
     """
-    # Special case: open-to-close same day (treat as 1 day)
-    if target_name == 'fwd_ret_oc_same_day':
-        return {'value': 1, 'unit': 'd', 'minutes': 1440}
+    # Start with all columns except the target itself
+    safe_columns = [c for c in all_columns if c != target_column]
     
-    # Pattern for fwd_ret_XXd or fwd_ret_XXm
-    fwd_ret_match = re.match(r'fwd_ret_(\d+)([dm])', target_name)
-    if fwd_ret_match:
-        value = int(fwd_ret_match.group(1))
-        unit = fwd_ret_match.group(2)
-        minutes = value * 1440 if unit == 'd' else value
-        return {'value': value, 'unit': unit, 'minutes': minutes}
+    # Get target metadata
+    target_type = _classify_target_type(target_column)
+    target_horizon = _extract_horizon(target_column)
     
-    # Pattern for XXm in target name (e.g., peak_60m, valley_30m, y_will_peak_mfe_10m_0.001)
-    # This will match the first occurrence of XXm in the name
-    minutes_match = re.search(r'(\d+)m', target_name)
-    if minutes_match:
-        value = int(minutes_match.group(1))
-        return {'value': value, 'unit': 'm', 'minutes': value}
+    # Apply target-specific filtering rules
+    if target_type == 'forward_return':
+        safe_columns = _filter_for_forward_return_target(
+            safe_columns, target_column, target_horizon, verbose
+        )
+    elif target_type == 'barrier':
+        safe_columns = _filter_for_barrier_target(
+            safe_columns, target_column, target_horizon, verbose
+        )
+    elif target_type == 'first_touch':
+        # First touch targets are already leaked (correlated with hit_direction)
+        # But we still filter features
+        safe_columns = _filter_for_barrier_target(
+            safe_columns, target_column, target_horizon, verbose
+        )
     
-    # Pattern for XXd in target name
-    days_match = re.search(r'(\d+)d', target_name)
-    if days_match:
-        value = int(days_match.group(1))
-        return {'value': value, 'unit': 'd', 'minutes': value * 1440}
+    # Always exclude these leaking features regardless of target type
+    always_exclude = _get_always_excluded_features()
+    excluded = [c for c in safe_columns if _matches_any_pattern(c, always_exclude)]
+    safe_columns = [c for c in safe_columns if c not in excluded]
+    
+    if verbose and excluded:
+        logger.info(f"  Excluded {len(excluded)} always-leaked features")
+    
+    return safe_columns
+
+
+def _classify_target_type(target_column: str) -> str:
+    """Classify target type from column name"""
+    if target_column.startswith('fwd_ret_'):
+        return 'forward_return'
+    elif target_column.startswith('y_will_'):
+        return 'barrier'
+    elif 'first_touch' in target_column:
+        return 'first_touch'
+    else:
+        return 'unknown'
+
+
+def _extract_horizon(target_column: str) -> Optional[int]:
+    """
+    Extract horizon from target column name (in minutes)
+    
+    Examples:
+        fwd_ret_60m -> 60
+        y_will_peak_15m_0.8 -> 15
+        fwd_ret_1d -> 1440 (assuming 1d = 1440 minutes)
+    """
+    # Pattern: number followed by 'm', 'h', or 'd'
+    patterns = [
+        (r'(\d+)m', lambda x: int(x)),  # minutes
+        (r'(\d+)h', lambda x: int(x) * 60),  # hours -> minutes
+        (r'(\d+)d', lambda x: int(x) * 1440),  # days -> minutes
+    ]
+    
+    for pattern, converter in patterns:
+        match = re.search(pattern, target_column)
+        if match:
+            return converter(match.group(1))
     
     return None
 
 
-def get_temporal_overlap_features(
-    horizon_minutes: int, 
-    all_feature_names: List[str] = None,
-    config: dict = None
-) -> Set[str]:
-    """
-    Get features that would create temporal overlap with target horizon.
-    
-    For a target with horizon H minutes, exclude features with windows:
-    - Exactly H minutes (direct overlap)
-    - H/2 to H*1.5 minutes (strong autocorrelation)
-    - For daily targets: exclude features with matching day windows
-    
-    Args:
-        horizon_minutes: Target prediction horizon in minutes
-        config: Exclusion config (loads from file if None)
-    
-    Returns:
-        Set of feature names to exclude
-    """
-    if config is None:
-        config = load_exclusion_config()
-    
-    excluded = set()
-    
-    # Get all temporal overlap patterns from config
-    temporal_patterns = config.get('temporal_overlap_30m_plus', [])
-    
-    # For minute-based horizons, exclude features with matching windows
-    if horizon_minutes <= 1440:  # <= 1 day
-        # Exclude features with windows in range [horizon/2, horizon*1.5]
-        min_window = max(1, horizon_minutes // 2)
-        max_window = int(horizon_minutes * 1.5)
-        
-        # Pattern to match: ret_XXm, vol_XXm, etc.
-        for pattern in temporal_patterns:
-            # Extract window size if it's a minute-based feature
-            match = re.search(r'(\d+)m', pattern)
-            if match:
-                window_minutes = int(match.group(1))
-                if min_window <= window_minutes <= max_window:
-                    excluded.add(pattern)
-    
-    # If we have actual feature names, dynamically scan for matching windows
-    if all_feature_names:
-        # For minute-based horizons
-        if horizon_minutes <= 1440:  # <= 1 day
-            min_window = max(1, horizon_minutes // 2)
-            max_window = int(horizon_minutes * 1.5)
-            for feature_name in all_feature_names:
-                matches = re.finditer(r'(\d+)m', feature_name)
-                for match in matches:
-                    window_minutes = int(match.group(1))
-                    if (min_window <= window_minutes <= max_window) or (window_minutes >= horizon_minutes):
-                        excluded.add(feature_name)
-                        break
-        
-        # For day-based horizons
-        elif horizon_minutes > 1440:  # > 1 day
-            horizon_days = horizon_minutes / 1440
-            min_window_days = max(1, horizon_days / 2)
-            max_window_days = horizon_days * 1.5
-            
-            for feature_name in all_feature_names:
-                # Pattern 1: XXd
-                matches = re.finditer(r'(\d+)d', feature_name)
-                for match in matches:
-                    window_days = int(match.group(1))
-                    if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
-                        excluded.add(feature_name)
-                        break
-                
-                # Pattern 2: _XX (no suffix)
-                matches = re.finditer(r'_(\d+)(?:_|$)', feature_name)
-                for match in matches:
-                    window_value = int(match.group(1))
-                    if 1 <= window_value <= 365:
-                        window_days = window_value
-                        if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
-                            excluded.add(feature_name)
-                            break
-            
-            # Minute-based features that overlap with day horizon
-            for feature_name in all_feature_names:
-                matches = re.finditer(r'(\d+)m', feature_name)
-                for match in matches:
-                    window_minutes = int(match.group(1))
-                    window_days = window_minutes / 1440
-                    if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
-                        excluded.add(feature_name)
-                        break
-    else:
-        # Fallback: use config patterns only (old behavior)
-        if horizon_minutes <= 1440:
-            min_window = max(1, horizon_minutes // 2)
-            max_window = int(horizon_minutes * 1.5)
-            # If we have actual feature names, dynamically scan
-            if all_feature_names:
-                for feature_name in all_feature_names:
-                    # Pattern 1: XXd
-                    matches = re.finditer(r'(\d+)d', feature_name)
-                    for match in matches:
-                        window_days = int(match.group(1))
-                        if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
-                            excluded.add(feature_name)
-                            break
-                    # Pattern 2: _XX (no suffix)
-                    matches = re.finditer(r'_(\d+)(?:_|$)', feature_name)
-                    for match in matches:
-                        window_value = int(match.group(1))
-                        if 1 <= window_value <= 365:
-                            window_days = window_value
-                            if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
-                                excluded.add(feature_name)
-                                break
-                # Minute-based features that overlap
-                for feature_name in all_feature_names:
-                    matches = re.finditer(r'(\d+)m', feature_name)
-                    for match in matches:
-                        window_minutes = int(match.group(1))
-                        window_days = window_minutes / 1440
-                        if (min_window_days <= window_days <= max_window_days) or (window_days >= horizon_days):
-                            excluded.add(feature_name)
-                            break
-                    if min_window <= window_minutes <= max_window:
-                        excluded.add(pattern)
-        elif horizon_minutes > 1440:
-            horizon_days = horizon_minutes / 1440
-            min_window_days = max(1, horizon_days / 2)
-            max_window_days = horizon_days * 1.5
-            for pattern in temporal_patterns:
-                match = re.search(r'(\d+)d', pattern)
-                if match:
-                    window_days = int(match.group(1))
-                    if min_window_days <= window_days <= max_window_days:
-                        excluded.add(pattern)
-                match = re.search(r'(\d+)m', pattern)
-                if match:
-                    window_minutes = int(match.group(1))
-                    window_days = window_minutes / 1440
-                    if min_window_days <= window_days <= max_window_days:
-                        excluded.add(pattern)
-    
-    return excluded
-
-
-def get_excluded_features_for_target(
-    target_name: str,
-    all_feature_names: List[str] = None,
-    config: dict = None,
-    exclude_definite_leaks: bool = True,
-    exclude_temporal_overlap: bool = True
-) -> Set[str]:
-    """
-    Get set of features to exclude for a specific target.
-    
-    This is target-aware filtering that:
-    1. Always excludes definite leaks
-    2. Excludes temporal overlap features based on target horizon
-    3. Excludes metadata and target columns
-    
-    Args:
-        target_name: Name of the target (e.g., 'fwd_ret_20d', 'peak_60m_0.8')
-        config: Exclusion config (loads from file if None)
-        exclude_definite_leaks: Whether to exclude definite leaks
-        exclude_temporal_overlap: Whether to exclude temporal overlap features
-    
-    Returns:
-        Set of feature names to exclude
-    """
-    if config is None:
-        config = load_exclusion_config()
-    
-    excluded = set()
-    
-    # Always exclude definite leaks
-    if exclude_definite_leaks and config.get('exclude_definite_leaks', True):
-        excluded.update(config.get('definite_leaks', []))
-    
-    # Exclude temporal overlap features based on target horizon
-    if exclude_temporal_overlap:
-        horizon_info = extract_target_horizon(target_name)
-        if horizon_info:
-            temporal_overlap = get_temporal_overlap_features(
-                horizon_info['minutes'], 
-                all_feature_names=all_feature_names,
-                config=config
-            )
-            excluded.update(temporal_overlap)
-            
-            # SPECIAL CASE: For forward return targets, exclude ALL return/volatility/momentum
-            # features with ANY day-based window (they're inherently autocorrelated)
-            if target_name.startswith('fwd_ret_') and all_feature_names:
-# re is already imported at module level
-                # Patterns that indicate return/volatility/momentum features
-                leaky_patterns = [
-                    r'ret.*\d+[dm]',      # returns_5d, ret_20d, etc.
-                    r'vol.*\d+[dm]',      # volatility_5d, vol_20d, etc.
-                    r'mom.*\d+[dm]',      # momentum_5d, mom_20d, etc.
-                    r'returns_\d+[dm]',   # returns_5d, returns_20d
-                    r'volatility_\d+[dm]', # volatility_5d, volatility_20d
-                    r'price_momentum_\d+[dm]',  # price_momentum_5d
-                    r'sector_momentum_\d+[dm]', # sector_momentum_5d
-                    r'volume_momentum_\d+[dm]',  # volume_momentum_5d
-                    r'relative_performance_\d+[dm]', # relative_performance_5d
-                    r'ret_x_mom_\d+[dm]', # ret_x_mom_5d
-                    r'vol_x_mom_\d+[dm]', # vol_x_mom_5d
-                ]
-                
-                for feature_name in all_feature_names:
-                    # Check if feature matches any leaky pattern
-                    for pattern in leaky_patterns:
-                        if re.search(pattern, feature_name, re.IGNORECASE):
-                            excluded.add(feature_name)
-                            break
-                    
-                    # Also check for _XX patterns (no suffix) that might be days
-                    # Only for return/volatility/momentum features
-                    if any(term in feature_name.lower() for term in ['ret', 'vol', 'mom', 'momentum']):
-                        matches = list(re.finditer(r'_(\d+)(?:_|$)', feature_name))
-                        for match in matches:
-                            value = int(match.group(1))
-                            # If it's a reasonable day value (1-365) and feature is return/vol/mom related
-                            if 1 <= value <= 365:
-                                excluded.add(feature_name)
-                                break
-            
-            logger.debug(
-                f"Target {target_name} (horizon: {horizon_info['value']}{horizon_info['unit']}): "
-                f"Excluding {len(temporal_overlap)} temporal overlap features"
-            )
-        else:
-            # Fallback: use default temporal overlap (30m+ for 60m targets)
-            if config.get('exclude_temporal_overlap', True):
-                excluded.update(config.get('temporal_overlap_30m_plus', []))
-    
-    # Exclude metadata columns
-    if config.get('exclude_metadata', True):
-        excluded.update(config.get('metadata_columns', []))
-    
-    # Exclude target columns (patterns)
-    if config.get('exclude_targets', True):
-        target_patterns = config.get('target_patterns', [])
-        # Don't exclude the current target itself (it's needed)
-        for pattern in target_patterns:
-            if not re.match(pattern, target_name):
-                # This pattern doesn't match our target, so exclude features matching it
-                # (We'll handle target exclusion separately in filter_features)
-                pass
-    
-    return excluded
-
-
-def filter_features_for_target(
-    all_columns: List[str],
-    target_name: str,
-    config: dict = None,
-    verbose: bool = True
+def _filter_for_forward_return_target(
+    columns: List[str],
+    target_column: str,
+    target_horizon: Optional[int],
+    verbose: bool
 ) -> List[str]:
     """
-    Filter feature list for a specific target, excluding:
-    1. Definite leaks
-    2. Temporal overlap features (target-aware)
-    3. Metadata columns
-    4. Target columns (except the current target)
+    Filter features for forward return targets.
     
-    Args:
-        all_columns: List of all column names in dataset
-        target_name: Name of the target being predicted
-        config: Exclusion config (loads from file if None)
-        verbose: Whether to log filtering stats
-    
-    Returns:
-        List of safe feature columns for this target
+    Excludes:
+    - Features computed from future returns (overlapping windows)
+    - Features that use information beyond the target horizon
     """
-    if config is None:
-        config = load_exclusion_config()
+    excluded = []
+    safe = []
     
-    # Get excluded features for this target
-    excluded_set = get_excluded_features_for_target(
-        target_name, 
-        all_feature_names=all_columns,
-        config=config
-    )
-    
-    # Get target patterns (to exclude other targets)
-    target_patterns = config.get('target_patterns', []) if config.get('exclude_targets', True) else []
-    
-    # Filter columns
-    safe_features = []
-    excluded_by_name = []
-    excluded_by_pattern = []
-    
-    for col in all_columns:
-        # Skip the target itself (it's not a feature)
-        if col == target_name:
-            continue
+    for col in columns:
+        should_exclude = False
         
-        # Check if in exclusion set
-        if col in excluded_set:
-            excluded_by_name.append(col)
-            continue
+        # Exclude forward returns with overlapping or longer horizons
+        if col.startswith('fwd_ret_'):
+            col_horizon = _extract_horizon(col)
+            if col_horizon is not None and target_horizon is not None:
+                # Exclude if feature horizon >= target horizon (overlaps)
+                if col_horizon >= target_horizon:
+                    should_exclude = True
+                    excluded.append((col, "overlapping forward return"))
         
-        # Check if matches target pattern (but not the current target)
-        if matches_target_pattern(col, target_patterns):
-            excluded_by_pattern.append(col)
-            continue
+        # Exclude features computed from future paths
+        if any(col.startswith(prefix) for prefix in [
+            'tth_',  # time-to-hit (knows when barrier will be hit)
+            'mfe_share_',  # fraction of time in profit (requires future path)
+            'time_in_profit_',  # duration in profit (requires future path)
+            'flipcount_',  # number of flips (requires future path)
+        ]):
+            should_exclude = True
+            excluded.append((col, "future path feature"))
         
-        # Safe feature
-        safe_features.append(col)
+        # Exclude barrier hit features (they're targets, not features)
+        if col.startswith('y_will_') or col.startswith('y_first_touch'):
+            should_exclude = True
+            excluded.append((col, "barrier target (not a feature)"))
+        
+        if not should_exclude:
+            safe.append(col)
     
-    # Log stats
-    if verbose:
-        horizon_info = extract_target_horizon(target_name)
-        horizon_str = f" (horizon: {horizon_info['value']}{horizon_info['unit']})" if horizon_info else ""
-        logger.info(f"Feature filtering for {target_name}{horizon_str}:")
-        logger.info(f"  Total columns: {len(all_columns)}")
-        logger.info(f"  Safe features: {len(safe_features)}")
-        logger.info(f"  Excluded by name: {len(excluded_by_name)}")
-        logger.info(f"  Excluded by pattern: {len(excluded_by_pattern)}")
+    if verbose and excluded:
+        logger.info(f"  Excluded {len(excluded)} features for forward return target:")
+        for col, reason in excluded[:10]:  # Show first 10
+            logger.info(f"    - {col}: {reason}")
+        if len(excluded) > 10:
+            logger.info(f"    ... and {len(excluded) - 10} more")
     
-    return safe_features
+    return safe
 
 
-def matches_target_pattern(column_name: str, patterns: List[str]) -> bool:
-    """Check if column matches any target pattern (regex)"""
+def _filter_for_barrier_target(
+    columns: List[str],
+    target_column: str,
+    target_horizon: Optional[int],
+    verbose: bool
+) -> List[str]:
+    """
+    Filter features for barrier targets (y_will_peak, y_will_valley, etc.).
+    
+    Excludes:
+    - Features that know about barrier hits (tth_*, hit_direction_*, etc.)
+    - Features computed from future paths
+    - First touch targets (they're leaked)
+    """
+    excluded = []
+    safe = []
+    
+    for col in columns:
+        should_exclude = False
+        
+        # Exclude features that know about barrier hits
+        if any(col.startswith(prefix) for prefix in [
+            'tth_',  # time-to-hit
+            'tth_abs_',  # absolute time-to-hit
+            'hit_direction_',  # which barrier hits first (correlated with first_touch)
+            'hit_asym_',  # asymmetric barrier hit
+        ]):
+            should_exclude = True
+            excluded.append((col, "barrier hit feature"))
+        
+        # Exclude first touch targets (they're leaked - correlated with hit_direction)
+        if 'first_touch' in col and col.startswith('y_'):
+            should_exclude = True
+            excluded.append((col, "first_touch target (leaked)"))
+        
+        # Exclude features computed from future paths
+        if any(col.startswith(prefix) for prefix in [
+            'mfe_share_',  # fraction of time in profit
+            'time_in_profit_',  # duration in profit
+            'flipcount_',  # number of flips
+        ]):
+            should_exclude = True
+            excluded.append((col, "future path feature"))
+        
+        # Exclude other barrier targets (they're targets, not features)
+        if col.startswith('y_will_') and col != target_column:
+            should_exclude = True
+            excluded.append((col, "other barrier target"))
+        
+        if not should_exclude:
+            safe.append(col)
+    
+    if verbose and excluded:
+        logger.info(f"  Excluded {len(excluded)} features for barrier target:")
+        for col, reason in excluded[:10]:  # Show first 10
+            logger.info(f"    - {col}: {reason}")
+        if len(excluded) > 10:
+            logger.info(f"    ... and {len(excluded) - 10} more")
+    
+    return safe
+
+
+def _get_always_excluded_features() -> List[str]:
+    """
+    Get patterns for features that should always be excluded (regardless of target).
+    
+    These are features that leak information by definition.
+    """
+    return [
+        r'^tth_',  # time-to-hit
+        r'^tth_abs_',  # absolute time-to-hit
+        r'^mfe_share_',  # max favorable excursion share
+        r'^time_in_profit_',  # time in profit
+        r'^flipcount_',  # flip count
+        r'^hit_direction_',  # hit direction (correlated with first_touch)
+        r'^hit_asym_',  # asymmetric hit
+        r'^y_first_touch',  # first touch (leaked)
+    ]
+
+
+def _matches_any_pattern(text: str, patterns: List[str]) -> bool:
+    """Check if text matches any regex pattern"""
+    import re
     for pattern in patterns:
-        if re.match(pattern, column_name):
+        if re.match(pattern, text):
             return True
     return False
-
-
-# Backward compatibility: re-export functions from filter_leaking_features
-def get_excluded_features(config: dict = None) -> Set[str]:
-    """Backward compatibility wrapper"""
-    return get_excluded_features_for_target("", config, exclude_temporal_overlap=False)
-
-
-def filter_features(
-    all_columns: List[str],
-    config: dict = None,
-    verbose: bool = True
-) -> List[str]:
-    """Backward compatibility wrapper (target-agnostic filtering)"""
-    if config is None:
-        config = load_exclusion_config()
-    
-    excluded_set = get_excluded_features(config)
-    target_patterns = config.get('target_patterns', []) if config.get('exclude_targets', True) else []
-    
-    safe_features = []
-    for col in all_columns:
-        if col in excluded_set:
-            continue
-        if matches_target_pattern(col, target_patterns):
-            continue
-        safe_features.append(col)
-    
-    if verbose:
-        logger.info(f"Feature filtering (target-agnostic):")
-        logger.info(f"  Total columns: {len(all_columns)}")
-        logger.info(f"  Safe features: {len(safe_features)}")
-    
-    return safe_features
-

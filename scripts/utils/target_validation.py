@@ -6,14 +6,21 @@ Used across all ranking scripts for consistent behavior
 import numpy as np
 import warnings
 from typing import Tuple, Optional
+from scripts.utils.task_types import TaskType
 
 
-def validate_target(y: np.ndarray, min_samples: int = 10, min_class_samples: int = 2) -> Tuple[bool, Optional[str]]:
+def validate_target(
+    y: np.ndarray, 
+    task_type: Optional[TaskType] = None,
+    min_samples: int = 10, 
+    min_class_samples: int = 2
+) -> Tuple[bool, Optional[str]]:
     """
     Validate that a target is suitable for model training
     
     Args:
         y: Target array
+        task_type: Optional TaskType (if None, will be inferred)
         min_samples: Minimum total samples required
         min_class_samples: Minimum samples per class (for classification)
     
@@ -28,6 +35,24 @@ def validate_target(y: np.ndarray, min_samples: int = 10, min_class_samples: int
     if len(y_clean) < min_samples:
         return False, f"Too few samples: {len(y_clean)} < {min_samples}"
     
+    # Infer task type if not provided
+    if task_type is None:
+        unique_vals = np.unique(y_clean)
+        n_unique = len(unique_vals)
+        
+        if n_unique == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0}):
+            task_type = TaskType.BINARY_CLASSIFICATION
+        elif n_unique <= 10:
+            # Check if integer-like (classification) vs continuous (regression)
+            if all(isinstance(v, (int, np.integer)) or 
+                   (isinstance(v, float) and float(v).is_integer()) 
+                   for v in unique_vals):
+                task_type = TaskType.MULTICLASS_CLASSIFICATION
+            else:
+                task_type = TaskType.REGRESSION
+        else:
+            task_type = TaskType.REGRESSION
+    
     # Check unique values
     unique_vals = np.unique(y_clean)
     n_unique = len(unique_vals)
@@ -35,25 +60,44 @@ def validate_target(y: np.ndarray, min_samples: int = 10, min_class_samples: int
     if n_unique < 2:
         return False, f"Only {n_unique} unique value(s) (degenerate target)"
     
-    # For classification-like targets, check class balance
-    if n_unique <= 10:
+    # Task-specific validation
+    if task_type == TaskType.BINARY_CLASSIFICATION:
+        if n_unique != 2:
+            return False, f"Binary classification requires exactly 2 classes, found {n_unique}"
+        
+        class_counts = np.bincount(y_clean.astype(int))
+        min_class_count = class_counts[class_counts > 0].min()
+        
+        if min_class_count < min_class_samples:
+            return False, f"Smallest class has only {min_class_count} sample(s) (too few for CV)"
+    
+    elif task_type == TaskType.MULTICLASS_CLASSIFICATION:
+        if n_unique < 2:
+            return False, f"Multiclass requires at least 2 classes, found {n_unique}"
+        
         try:
-            # Try to get class counts
-            if all(isinstance(v, (int, np.integer)) or (isinstance(v, float) and float(v).is_integer())
-                   for v in unique_vals):
-                class_counts = np.bincount(y_clean.astype(int))
-                min_class_count = class_counts[class_counts > 0].min()
-                
-                if min_class_count < min_class_samples:
-                    return False, f"Smallest class has only {min_class_count} sample(s) (too few for CV)"
+            class_counts = np.bincount(y_clean.astype(int))
+            min_class_count = class_counts[class_counts > 0].min()
+            
+            if min_class_count < min_class_samples:
+                return False, f"Smallest class has only {min_class_count} sample(s) (too few for CV)"
         except (ValueError, OverflowError):
-            # Not integer-like, treat as regression
-            pass
+            return False, "Invalid class labels for multiclass classification"
+    
+    elif task_type == TaskType.REGRESSION:
+        # For regression, check variance
+        std = y_clean.std()
+        if std < 1e-6:
+            return False, f"Zero or near-zero variance (std={std:.2e})"
     
     return True, None
 
 
-def check_cv_compatibility(y: np.ndarray, cv_folds: int = 3) -> Tuple[bool, Optional[str]]:
+def check_cv_compatibility(
+    y: np.ndarray, 
+    task_type: Optional[TaskType] = None,
+    cv_folds: int = 3
+) -> Tuple[bool, Optional[str]]:
     """
     Check if target is compatible with cross-validation
     
@@ -62,6 +106,7 @@ def check_cv_compatibility(y: np.ndarray, cv_folds: int = 3) -> Tuple[bool, Opti
     
     Args:
         y: Target array
+        task_type: Optional TaskType (if None, will be inferred)
         cv_folds: Number of CV folds
     
     Returns:
@@ -71,8 +116,22 @@ def check_cv_compatibility(y: np.ndarray, cv_folds: int = 3) -> Tuple[bool, Opti
     unique_vals = np.unique(y_clean)
     n_unique = len(unique_vals)
     
-    # For classification-like targets
-    if n_unique <= 10:
+    # Infer task type if not provided
+    if task_type is None:
+        if n_unique == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0}):
+            task_type = TaskType.BINARY_CLASSIFICATION
+        elif n_unique <= 10:
+            if all(isinstance(v, (int, np.integer)) or 
+                   (isinstance(v, float) and float(v).is_integer()) 
+                   for v in unique_vals):
+                task_type = TaskType.MULTICLASS_CLASSIFICATION
+            else:
+                task_type = TaskType.REGRESSION
+        else:
+            task_type = TaskType.REGRESSION
+    
+    # For classification targets, check class balance
+    if task_type in {TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION}:
         try:
             if all(isinstance(v, (int, np.integer)) or (isinstance(v, float) and float(v).is_integer())
                    for v in unique_vals):
@@ -84,7 +143,7 @@ def check_cv_compatibility(y: np.ndarray, cv_folds: int = 3) -> Tuple[bool, Opti
                 if min_class_count < min_required:
                     return False, f"Smallest class has {min_class_count} samples, need {min_required} for {cv_folds}-fold CV"
         except (ValueError, OverflowError):
-            pass
+            return False, "Invalid class labels for classification"
     
     return True, None
 

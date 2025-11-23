@@ -28,7 +28,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Union
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
@@ -44,6 +44,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 # Import checkpoint utility (after path is set)
 from scripts.utils.checkpoint import CheckpointManager
+
+# Import unified task type system
+from scripts.utils.task_types import (
+    TaskType, TargetConfig, ModelConfig, 
+    is_compatible, create_model_configs_from_yaml
+)
+from scripts.utils.task_metrics import evaluate_by_task, compute_composite_score
+from scripts.utils.target_validation import validate_target, check_cv_compatibility
 
 # Suppress expected warnings (harmless)
 warnings.filterwarnings('ignore', message='X does not have valid feature names')
@@ -104,7 +112,7 @@ def load_target_configs() -> Dict[str, Dict]:
     return config['targets']
 
 
-def discover_all_targets(symbol: str, data_dir: Path) -> Dict[str, Dict]:
+def discover_all_targets(symbol: str, data_dir: Path) -> Dict[str, TargetConfig]:
     """
     Auto-discover all valid targets from data (non-degenerate).
     
@@ -112,7 +120,7 @@ def discover_all_targets(symbol: str, data_dir: Path) -> Dict[str, Dict]:
     - y_* targets (barrier, swing, MFE/MDD targets)
     - fwd_ret_* targets (forward return targets)
     
-    Returns dict of {target_name: config} for all valid targets found.
+    Returns dict of {target_name: TargetConfig} for all valid targets found.
     """
     import pandas as pd
     import numpy as np
@@ -183,26 +191,43 @@ def discover_all_targets(symbol: str, data_dir: Path) -> Dict[str, Dict]:
             first_touch_count += 1
             continue
         
+        # Infer task type from data
+        task_type = TaskType.from_target_column(target_col, y)
+        
         # FIX 1: Use full target_col as key to avoid collisions
         # (e.g., y_squeeze and y_will_squeeze both become "squeeze" with old logic)
         # Store display_name for UI/logging purposes
         if target_col.startswith('y_'):
             display_name = target_col.replace('y_will_', '').replace('y_', '')
-            target_type = 'Classification' if n_unique <= 10 else 'Regression'
         else:  # fwd_ret_*
             display_name = target_col  # Keep full name for forward returns
-            target_type = 'Regression'
         
-        # Use target_col as the key (unique, no collisions)
-        valid_targets[target_col] = {
-            'target_column': target_col,  # Matches the key
-            'display_name': display_name,  # Short name for UI/logging
-            'description': f"Auto-discovered target: {target_col}",
-            'use_case': f"{target_type} target",
-            'top_n': 60,
-            'method': 'mean',
-            'enabled': True
-        }
+        # Extract horizon if possible
+        horizon = None
+        import re
+        horizon_match = re.search(r'(\d+)[mhd]', target_col)
+        if horizon_match:
+            horizon_val = int(horizon_match.group(1))
+            if 'd' in target_col:
+                horizon = horizon_val * 1440  # days to minutes
+            elif 'h' in target_col:
+                horizon = horizon_val * 60  # hours to minutes
+            else:
+                horizon = horizon_val  # minutes
+        
+        # Create TargetConfig object
+        valid_targets[target_col] = TargetConfig(
+            name=target_col,
+            target_column=target_col,
+            task_type=task_type,
+            horizon=horizon,
+            display_name=display_name,
+            description=f"Auto-discovered target: {target_col}",
+            use_case=f"{task_type.name} target",
+            top_n=60,
+            method='mean',
+            enabled=True
+        )
     
     logger.info(f"  Discovered {len(valid_targets)} valid targets")
     logger.info(f"    - y_* targets: {len([t for t in valid_targets.values() if t['target_column'].startswith('y_')])}")
@@ -240,10 +265,18 @@ def load_sample_data(
 
 def prepare_features_and_target(
     df: pd.DataFrame,
-    target_column: str
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Prepare features and target for modeling"""
+    target_column: str,
+    target_config: Optional[TargetConfig] = None
+) -> Tuple[np.ndarray, np.ndarray, List[str], TaskType]:
+    """
+    Prepare features and target for modeling
     
+    Returns:
+        X: Feature matrix
+        y: Target array
+        feature_names: List of feature names
+        task_type: TaskType enum
+    """
     # Check target exists
     if target_column not in df.columns:
         raise ValueError(f"Target '{target_column}' not in data")
@@ -254,10 +287,15 @@ def prepare_features_and_target(
     if df.empty:
         raise ValueError("No valid data after dropping NaN in target")
     
+    # Get target config or infer task type
+    if target_config is None:
+        y_sample = df[target_column].dropna()
+        task_type = TaskType.from_target_column(target_column, y_sample.to_numpy())
+    else:
+        task_type = target_config.task_type
+    
     # LEAKAGE PREVENTION: Filter out leaking features (target-aware)
-    import sys
-    sys.path.insert(0, str(_REPO_ROOT / "scripts" / "utils"))
-    from leakage_filtering import filter_features_for_target
+    from scripts.utils.leakage_filtering import filter_features_for_target
     
     all_columns = df.columns.tolist()
     # Use target-aware filtering to exclude temporal overlap features
@@ -278,7 +316,7 @@ def prepare_features_and_target(
     y = df[target_column]
     feature_names = X.columns.tolist()
     
-    return X.to_numpy(), y.to_numpy(), feature_names
+    return X.to_numpy(), y.to_numpy(), feature_names, task_type
 
 
 def load_multi_model_config(config_path: Path = None) -> Dict[str, Any]:
@@ -313,14 +351,23 @@ def train_and_evaluate_models(
     X: np.ndarray,
     y: np.ndarray,
     feature_names: List[str],
+    task_type: TaskType,
     model_families: List[str] = None,
     multi_model_config: Dict[str, Any] = None
-) -> Tuple[Dict[str, float], float]:
+) -> Tuple[Dict[str, Dict[str, float]], float]:
     """
-    Train multiple models and return scores + importance magnitude
+    Train multiple models and return task-aware metrics + importance magnitude
+    
+    Args:
+        X: Feature matrix
+        y: Target array
+        feature_names: List of feature names
+        task_type: TaskType enum (REGRESSION, BINARY_CLASSIFICATION, MULTICLASS_CLASSIFICATION)
+        model_families: List of model family names to use
+        multi_model_config: Multi-model config dict
     
     Returns:
-        model_scores: Dict of R² scores per model
+        model_metrics: Dict of {model_name: {metric_name: value}} per model
         mean_importance: Mean absolute feature importance
     """
     from sklearn.model_selection import cross_val_score, TimeSeriesSplit
@@ -334,7 +381,7 @@ def train_and_evaluate_models(
     
     # CRITICAL: Use TimeSeriesSplit to enforce temporal causality
     # Standard K-Fold allows training on future data when testing on past data
-    # This would artificially inflate R² scores and make targets look more predictable
+    # This would artificially inflate scores and make targets look more predictable
     tscv = TimeSeriesSplit(n_splits=cv_folds)
     
     if model_families is None:
@@ -348,17 +395,86 @@ def train_and_evaluate_models(
         else:
             model_families = ['lightgbm', 'random_forest', 'neural_network']
     
-    model_scores = {}
+    # Create ModelConfig objects for this task type
+    model_configs = create_model_configs_from_yaml(multi_model_config, task_type) if multi_model_config else []
+    # Filter to only enabled model families
+    model_configs = [mc for mc in model_configs if mc.name in model_families]
+    
+    model_metrics = {}
+    model_scores = {}  # Keep for backward compatibility (primary scores)
     importance_magnitudes = []
     
-    # Determine task type (fixed detection)
+    # Determine task characteristics
     unique_vals = np.unique(y[~np.isnan(y)])
-    is_binary = len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0})
-    is_multiclass = len(unique_vals) <= 10 and all(isinstance(v, (int, np.integer)) or v.is_integer() for v in unique_vals)
+    is_binary = task_type == TaskType.BINARY_CLASSIFICATION
+    is_multiclass = task_type == TaskType.MULTICLASS_CLASSIFICATION
     is_classification = is_binary or is_multiclass
     
-    # Use R² for both (works for classification too, measures explained variance)
-    scoring = 'r2'
+    # Select scoring metric based on task type
+    if task_type == TaskType.REGRESSION:
+        scoring = 'r2'
+    elif task_type == TaskType.BINARY_CLASSIFICATION:
+        scoring = 'roc_auc'
+    else:  # MULTICLASS_CLASSIFICATION
+        scoring = 'accuracy'
+    
+    # Helper function to compute and store full task-aware metrics
+    def _compute_and_store_metrics(model_name: str, model, X: np.ndarray, y: np.ndarray, 
+                                   primary_score: float, task_type: TaskType):
+        """
+        Compute full task-aware metrics and store in both model_metrics and model_scores.
+        
+        Args:
+            model_name: Name of the model
+            model: Fitted model
+            X: Feature matrix (for predictions)
+            y: True target values
+            primary_score: Primary score from CV (R², AUC, or accuracy)
+            task_type: TaskType enum
+        """
+        # Store primary score for backward compatibility
+        model_scores[model_name] = primary_score
+        
+        # Compute full task-aware metrics
+        try:
+            if task_type == TaskType.REGRESSION:
+                y_pred = model.predict(X)
+                full_metrics = evaluate_by_task(task_type, y, y_pred, return_ic=True)
+            elif task_type == TaskType.BINARY_CLASSIFICATION:
+                if hasattr(model, 'predict_proba'):
+                    y_proba = model.predict_proba(X)[:, 1]  # Probability of class 1
+                else:
+                    # Fallback for models without predict_proba
+                    y_pred = model.predict(X)
+                    y_proba = np.clip(y_pred, 0, 1)  # Assume predictions are probabilities
+                full_metrics = evaluate_by_task(task_type, y, y_proba)
+            else:  # MULTICLASS_CLASSIFICATION
+                if hasattr(model, 'predict_proba'):
+                    y_proba = model.predict_proba(X)
+                else:
+                    # Fallback: one-hot encode predictions
+                    y_pred = model.predict(X)
+                    n_classes = len(np.unique(y[~np.isnan(y)]))
+                    y_proba = np.eye(n_classes)[y_pred.astype(int)]
+                full_metrics = evaluate_by_task(task_type, y, y_proba)
+            
+            # Store full metrics
+            model_metrics[model_name] = full_metrics
+        except Exception as e:
+            logger.warning(f"Failed to compute full metrics for {model_name}: {e}")
+            # Fallback to primary score only
+            if task_type == TaskType.REGRESSION:
+                model_metrics[model_name] = {'r2': primary_score}
+            elif task_type == TaskType.BINARY_CLASSIFICATION:
+                model_metrics[model_name] = {'roc_auc': primary_score}
+            else:
+                model_metrics[model_name] = {'accuracy': primary_score}
+    
+    # Helper function to update both model_scores and model_metrics
+    # NOTE: This is now mainly for backward compat - full metrics computed after training
+    def _update_model_score(model_name: str, score: float):
+        """Update model_scores (backward compat) - full metrics computed separately"""
+        model_scores[model_name] = score
     
     # Check for degenerate target BEFORE training models
     # A target is degenerate if it has < 2 unique values or one class has < 2 samples
@@ -424,10 +540,13 @@ def train_and_evaluate_models(
             
             scores = cross_val_score(model, X, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
             valid_scores = scores[~np.isnan(scores)]
-            model_scores['lightgbm'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+            primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
-            # Train once to get importance
+            # Train once to get importance and full metrics
             model.fit(X, y)
+            
+            # Compute and store full task-aware metrics
+            _compute_and_store_metrics('lightgbm', model, X, y, primary_score, task_type)
             # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
             importances = model.feature_importances_
             total_importance = np.sum(importances)
@@ -458,9 +577,12 @@ def train_and_evaluate_models(
             
             scores = cross_val_score(model, X, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
             valid_scores = scores[~np.isnan(scores)]
-            model_scores['random_forest'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+            primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
             model.fit(X, y)
+            
+            # Compute and store full task-aware metrics
+            _compute_and_store_metrics('random_forest', model, X, y, primary_score, task_type)
             # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
             importances = model.feature_importances_
             total_importance = np.sum(importances)
@@ -518,17 +640,23 @@ def train_and_evaluate_models(
                     # TransformedTargetRegressor handles scaling within each CV fold (no leakage)
                     scores = cross_val_score(model, X_scaled, y_for_training, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
                     valid_scores = scores[~np.isnan(scores)]
-                    model_scores['neural_network'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+                    primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
                 except ValueError as e:
                     if "least populated class" in str(e) or "too few" in str(e):
                         logger.debug(f"    Neural Network: Target too imbalanced for CV")
+                        primary_score = np.nan
+                        model_metrics['neural_network'] = {'roc_auc': np.nan} if task_type == TaskType.BINARY_CLASSIFICATION else {'r2': np.nan} if task_type == TaskType.REGRESSION else {'accuracy': np.nan}
                         model_scores['neural_network'] = np.nan
                     else:
                         raise
             
-            # Permutation importance magnitude (simplified)
             # Fit on scaled data (TransformedTargetRegressor handles target scaling internally)
-            model.fit(X_scaled, y_for_training)
+            if not np.isnan(primary_score):
+                model.fit(X_scaled, y_for_training)
+                
+                # Compute and store full task-aware metrics (use scaled X for predictions)
+                _compute_and_store_metrics('neural_network', model, X_scaled, y_for_training, primary_score, task_type)
+            
             baseline_score = model.score(X_scaled, y_for_training)
             
             perm_scores = []
@@ -575,16 +703,22 @@ def train_and_evaluate_models(
             try:
                 scores = cross_val_score(model, X, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
                 valid_scores = scores[~np.isnan(scores)]
-                model_scores['xgboost'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+                primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             except ValueError as e:
                 if "Invalid classes" in str(e) or "Expected" in str(e):
                     logger.debug(f"    XGBoost: Target degenerate in some CV folds")
+                    primary_score = np.nan
+                    model_metrics['xgboost'] = {'roc_auc': np.nan} if task_type == TaskType.BINARY_CLASSIFICATION else {'r2': np.nan} if task_type == TaskType.REGRESSION else {'accuracy': np.nan}
                     model_scores['xgboost'] = np.nan
                 else:
                     raise
             
-            # Train once to get importance
-            model.fit(X, y)
+            # Train once to get importance and full metrics
+            if not np.isnan(primary_score):
+                model.fit(X, y)
+                
+                # Compute and store full task-aware metrics
+                _compute_and_store_metrics('xgboost', model, X, y, primary_score, task_type)
             if hasattr(model, 'feature_importances_'):
                 # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
                 importances = model.feature_importances_
@@ -621,15 +755,21 @@ def train_and_evaluate_models(
             try:
                 scores = cross_val_score(model, X, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
                 valid_scores = scores[~np.isnan(scores)]
-                model_scores['catboost'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+                primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             except (ValueError, TypeError) as e:
                 if "Invalid classes" in str(e) or "Expected" in str(e):
                     logger.debug(f"    CatBoost: Target degenerate in some CV folds")
+                    primary_score = np.nan
+                    model_metrics['catboost'] = {'roc_auc': np.nan} if task_type == TaskType.BINARY_CLASSIFICATION else {'r2': np.nan} if task_type == TaskType.REGRESSION else {'accuracy': np.nan}
                     model_scores['catboost'] = np.nan
                 else:
                     raise
             
-            model.fit(X, y)
+            if not np.isnan(primary_score):
+                model.fit(X, y)
+                
+                # Compute and store full task-aware metrics
+                _compute_and_store_metrics('catboost', model, X, y, primary_score, task_type)
             importance = model.get_feature_importance()
             if len(importance) > 0:
                 total_importance = np.sum(importance)
@@ -663,9 +803,13 @@ def train_and_evaluate_models(
             model = Lasso(**lasso_config)
             scores = cross_val_score(model, X_imputed, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
             valid_scores = scores[~np.isnan(scores)]
-            model_scores['lasso'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+            primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
             model.fit(X_imputed, y)
+            
+            # Compute and store full task-aware metrics (Lasso is regression-only)
+            if not np.isnan(primary_score) and task_type == TaskType.REGRESSION:
+                _compute_and_store_metrics('lasso', model, X_imputed, y, primary_score, task_type)
             importance = np.abs(model.coef_)
             if len(importance) > 0:
                 total_importance = np.sum(importance)
@@ -1006,10 +1150,14 @@ def train_and_evaluate_models(
             
             scores = cross_val_score(model, X, y, cv=tscv, scoring=scoring, n_jobs=cv_n_jobs, error_score=np.nan)
             valid_scores = scores[~np.isnan(scores)]
-            model_scores['histogram_gradient_boosting'] = valid_scores.mean() if len(valid_scores) > 0 else np.nan
+            primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
-            # Train once to get importance
+            # Train once to get importance and full metrics
             model.fit(X, y)
+            
+            # Compute and store full task-aware metrics
+            if not np.isnan(primary_score):
+                _compute_and_store_metrics('histogram_gradient_boosting', model, X, y, primary_score, task_type)
             if hasattr(model, 'feature_importances_'):
                 # Use percentage of total importance in top 10% features (0-1 scale, interpretable)
                 importances = model.feature_importances_
@@ -1027,7 +1175,9 @@ def train_and_evaluate_models(
     
     mean_importance = np.mean(importance_magnitudes) if importance_magnitudes else 0.0
     
-    return model_scores, mean_importance
+    # model_scores already contains primary scores (backward compatible)
+    # model_metrics contains full metrics dict
+    return model_metrics, model_scores, mean_importance
 
 
 def detect_leakage(
@@ -1161,7 +1311,7 @@ def calculate_composite_score(
 
 def evaluate_target_predictability(
     target_name: str,
-    target_config: Dict[str, Any],
+    target_config: Dict[str, Any] | TargetConfig,
     symbols: List[str],
     data_dir: Path,
     model_families: List[str],
@@ -1169,9 +1319,24 @@ def evaluate_target_predictability(
 ) -> TargetPredictabilityScore:
     """Evaluate predictability of a single target across symbols"""
     
-    target_column = target_config['target_column']
-    # Use display_name if available, otherwise fall back to target_name
-    display_name = target_config.get('display_name', target_name)
+    # Convert dict config to TargetConfig if needed
+    if isinstance(target_config, dict):
+        target_column = target_config['target_column']
+        display_name = target_config.get('display_name', target_name)
+        # Infer task type from column name (will be refined with actual data)
+        task_type = TaskType.from_target_column(target_column)
+        target_config_obj = TargetConfig(
+            name=target_name,
+            target_column=target_column,
+            task_type=task_type,
+            display_name=display_name,
+            **{k: v for k, v in target_config.items() 
+               if k not in ['target_column', 'display_name']}
+        )
+    else:
+        target_config_obj = target_config
+        target_column = target_config_obj.target_column
+        display_name = target_config_obj.display_name or target_name
     logger.info(f"\n{'='*60}")
     logger.info(f"Evaluating: {display_name} ({target_column})")
     logger.info(f"{'='*60}")
@@ -1186,8 +1351,17 @@ def evaluate_target_predictability(
             # Load data
             df = load_sample_data(symbol, data_dir, max_samples=10000)
             
-            # Prepare features
-            X, y, feature_names = prepare_features_and_target(df, target_column)
+            # Prepare features (with target config if available)
+            target_config_obj = target_config if isinstance(target_config, TargetConfig) else None
+            X, y, feature_names, task_type = prepare_features_and_target(
+                df, target_column, target_config_obj
+            )
+            
+            # Validate target
+            is_valid, error_msg = validate_target(y, task_type=task_type)
+            if not is_valid:
+                logger.warning(f"Skipping {symbol}: {error_msg}")
+                continue
             
             # Check if target is degenerate in this sample (single class or too imbalanced)
             unique_vals = np.unique(y)
@@ -1203,10 +1377,13 @@ def evaluate_target_predictability(
                     logger.warning(f"Skipping: Smallest class has only {min_class_count} sample(s) (too few for CV)")
                     continue
             
-            # Train and evaluate
-            model_scores, importance = train_and_evaluate_models(
-                X, y, feature_names, model_families, multi_model_config
+            # Train and evaluate (with task type)
+            model_metrics, primary_scores, importance = train_and_evaluate_models(
+                X, y, feature_names, task_type, model_families, multi_model_config
             )
+            
+            # Convert to old format for backward compatibility
+            model_scores = primary_scores
             
             if model_scores:
                 all_model_scores.append(model_scores)

@@ -1,0 +1,279 @@
+"""
+Unified Task Type System for Target Ranking
+
+Defines TaskType enum and configuration classes (TargetConfig, ModelConfig)
+that enable a single pipeline to handle both regression and classification targets.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Callable, Dict, Any, Set, Optional, List
+import numpy as np
+import pandas as pd
+
+
+class TaskType(Enum):
+    """Task type for model training"""
+    REGRESSION = auto()
+    BINARY_CLASSIFICATION = auto()
+    MULTICLASS_CLASSIFICATION = auto()
+    
+    @classmethod
+    def from_target_column(cls, target_column: str, y: Optional[np.ndarray] = None) -> 'TaskType':
+        """
+        Infer task type from target column name and/or data
+        
+        Args:
+            target_column: Name of target column
+            y: Optional target values to inspect
+        
+        Returns:
+            TaskType enum
+        """
+        # Check column name patterns first
+        if target_column.startswith('fwd_ret_'):
+            return cls.REGRESSION
+        
+        # Binary classification patterns
+        if any(target_column.startswith(prefix) for prefix in [
+            'y_will_peak', 'y_will_valley', 'y_will_swing', 
+            'y_will_peak_mfe', 'y_will_valley_mdd'
+        ]):
+            # Could be binary or multiclass - check data if available
+            if y is not None:
+                unique_vals = np.unique(y[~np.isnan(y)])
+                if len(unique_vals) == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0}):
+                    return cls.BINARY_CLASSIFICATION
+                elif len(unique_vals) <= 10:
+                    return cls.MULTICLASS_CLASSIFICATION
+        
+        # Multiclass patterns
+        if any(target_column.startswith(prefix) for prefix in [
+            'y_first_touch', 'hit_direction', 'hit_asym'
+        ]):
+            return cls.MULTICLASS_CLASSIFICATION
+        
+        # If we have data, inspect it
+        if y is not None:
+            unique_vals = np.unique(y[~np.isnan(y)])
+            n_unique = len(unique_vals)
+            
+            if n_unique == 2 and set(unique_vals).issubset({0, 1, 0.0, 1.0}):
+                return cls.BINARY_CLASSIFICATION
+            elif n_unique <= 10:
+                # Check if integer-like (classification) vs continuous (regression)
+                if all(isinstance(v, (int, np.integer)) or 
+                       (isinstance(v, float) and float(v).is_integer()) 
+                       for v in unique_vals):
+                    return cls.MULTICLASS_CLASSIFICATION
+            
+            # Default to regression for continuous values
+            return cls.REGRESSION
+        
+        # Default fallback: assume regression
+        return cls.REGRESSION
+
+
+@dataclass
+class TargetConfig:
+    """Configuration for a target"""
+    name: str
+    target_column: str
+    task_type: TaskType
+    horizon: Optional[int] = None  # in bars/minutes/days
+    description: str = ""
+    display_name: Optional[str] = None
+    
+    # Optional metadata
+    class_thresholds: Dict[str, float] = field(default_factory=dict)
+    # e.g., {"long": 0.005, "short": -0.005} for binarizing returns
+    
+    # Legacy fields (for compatibility)
+    top_n: int = 60
+    method: str = "mean"
+    enabled: bool = True
+    use_case: str = ""
+    
+    def __post_init__(self):
+        """Set display_name if not provided"""
+        if self.display_name is None:
+            self.display_name = self.name
+
+
+@dataclass
+class ModelConfig:
+    """Configuration for a model family"""
+    name: str
+    constructor: Callable[..., Any]  # e.g., lambda **kw: LGBMRegressor(**kw)
+    supported_tasks: Set[TaskType]
+    default_params: Dict[str, Any] = field(default_factory=dict)
+    
+    # What metric should be primary for this model-task combo
+    primary_metric_by_task: Dict[TaskType, str] = field(default_factory=dict)
+    
+    # Extra capabilities if needed later
+    tags: Set[str] = field(default_factory=set)
+    
+    # Legacy fields (for compatibility with existing configs)
+    enabled: bool = True
+    weight: float = 1.0
+    importance_method: str = "native"
+    
+    def __post_init__(self):
+        """Set default primary metrics if not specified"""
+        if not self.primary_metric_by_task:
+            self.primary_metric_by_task = {
+                TaskType.REGRESSION: "r2",
+                TaskType.BINARY_CLASSIFICATION: "roc_auc",
+                TaskType.MULTICLASS_CLASSIFICATION: "accuracy"
+            }
+
+
+def is_compatible(target: TargetConfig, model: ModelConfig) -> bool:
+    """
+    Check if a model can train on a given target
+    
+    Args:
+        target: TargetConfig
+        model: ModelConfig
+    
+    Returns:
+        True if model supports the target's task type
+    """
+    return target.task_type in model.supported_tasks
+
+
+def create_model_configs_from_yaml(
+    multi_model_config: Dict[str, Any],
+    task_type: TaskType
+) -> List[ModelConfig]:
+    """
+    Create ModelConfig objects from YAML config
+    
+    Args:
+        multi_model_config: Loaded YAML config dict
+        task_type: Task type to filter models for
+    
+    Returns:
+        List of ModelConfig objects that support the given task_type
+    """
+    from typing import TYPE_CHECKING
+    
+    model_configs = []
+    model_families = multi_model_config.get('model_families', {})
+    
+    for model_name, model_spec in model_families.items():
+        if not model_spec.get('enabled', False):
+            continue
+        
+        # Determine supported tasks based on model type
+        # Most models support both regression and classification
+        supported_tasks = {TaskType.REGRESSION, TaskType.BINARY_CLASSIFICATION, 
+                          TaskType.MULTICLASS_CLASSIFICATION}
+        
+        # Some models are regression-only or classification-only
+        if model_name in ['lasso', 'ridge', 'elastic_net']:
+            supported_tasks = {TaskType.REGRESSION}
+        elif model_name in ['mutual_information', 'univariate_selection']:
+            # These support both but are feature selectors, not predictors
+            supported_tasks = {TaskType.REGRESSION, TaskType.BINARY_CLASSIFICATION,
+                              TaskType.MULTICLASS_CLASSIFICATION}
+        
+        # Filter by requested task_type
+        if task_type not in supported_tasks:
+            continue
+        
+        # Get constructor based on model name and task type
+        constructor = _get_model_constructor(model_name, task_type, model_spec.get('config', {}))
+        
+        if constructor is None:
+            continue
+        
+        # Create ModelConfig
+        config = ModelConfig(
+            name=model_name,
+            constructor=constructor,
+            supported_tasks=supported_tasks,
+            default_params=model_spec.get('config', {}),
+            enabled=model_spec.get('enabled', True),
+            weight=model_spec.get('weight', 1.0),
+            importance_method=model_spec.get('importance_method', 'native')
+        )
+        
+        model_configs.append(config)
+    
+    return model_configs
+
+
+def _get_model_constructor(
+    model_name: str,
+    task_type: TaskType,
+    config: Dict[str, Any]
+) -> Optional[Callable]:
+    """
+    Get model constructor function for a given model name and task type
+    
+    Returns:
+        Constructor function or None if model not available
+    """
+    import lightgbm as lgb
+    from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+    from sklearn.neural_network import MLPRegressor, MLPClassifier
+    from sklearn.linear_model import Lasso, LogisticRegression
+    
+    # Remove task-specific params from config (we'll set them explicitly)
+    config_clean = {k: v for k, v in config.items() 
+                    if k not in ['objective', 'metric', 'eval_metric', 'loss_function', 'device']}
+    
+    if model_name == 'lightgbm':
+        if task_type == TaskType.REGRESSION:
+            return lambda: lgb.LGBMRegressor(objective='regression', **config_clean)
+        elif task_type == TaskType.BINARY_CLASSIFICATION:
+            return lambda: lgb.LGBMClassifier(objective='binary', **config_clean)
+        elif task_type == TaskType.MULTICLASS_CLASSIFICATION:
+            return lambda n_classes: lgb.LGBMClassifier(objective='multiclass', num_class=n_classes, **config_clean)
+    
+    elif model_name == 'xgboost':
+        try:
+            import xgboost as xgb
+            if task_type == TaskType.REGRESSION:
+                return lambda: xgb.XGBRegressor(objective='reg:squarederror', **config_clean)
+            elif task_type == TaskType.BINARY_CLASSIFICATION:
+                return lambda: xgb.XGBClassifier(objective='binary:logistic', **config_clean)
+            elif task_type == TaskType.MULTICLASS_CLASSIFICATION:
+                return lambda n_classes: xgb.XGBClassifier(objective='multi:softprob', num_class=n_classes, **config_clean)
+        except ImportError:
+            return None
+    
+    elif model_name == 'random_forest':
+        if task_type == TaskType.REGRESSION:
+            return lambda: RandomForestRegressor(**config_clean)
+        elif task_type in {TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION}:
+            return lambda: RandomForestClassifier(**config_clean)
+    
+    elif model_name == 'neural_network':
+        if task_type == TaskType.REGRESSION:
+            return lambda: MLPRegressor(**config_clean)
+        elif task_type in {TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION}:
+            return lambda: MLPClassifier(**config_clean)
+    
+    elif model_name == 'catboost':
+        try:
+            import catboost as cb
+            if task_type == TaskType.REGRESSION:
+                return lambda: cb.CatBoostRegressor(**config_clean)
+            elif task_type in {TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION}:
+                return lambda: cb.CatBoostClassifier(**config_clean)
+        except ImportError:
+            return None
+    
+    elif model_name == 'lasso':
+        if task_type == TaskType.REGRESSION:
+            return lambda: Lasso(**config_clean)
+        # Lasso doesn't support classification directly
+        return None
+    
+    # Add more models as needed...
+    
+    return None
+
