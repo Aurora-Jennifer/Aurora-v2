@@ -493,8 +493,9 @@ def train_and_evaluate_models(
     task_type: TaskType,
     model_families: List[str] = None,
     multi_model_config: Dict[str, Any] = None,
-    target_column: str = None  # For leak reporting
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float], float, Dict[str, List[Tuple[str, float]]]]:
+    target_column: str = None,  # For leak reporting and horizon extraction
+    data_interval_minutes: int = 5  # Data bar interval (default: 5-minute bars)
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float], float, Dict[str, List[Tuple[str, float]]], Dict[str, Dict[str, float]]]:
     """
     Train multiple models and return task-aware metrics + importance magnitude
     
@@ -521,9 +522,11 @@ def train_and_evaluate_models(
     all_feature_importances = {}  # {model_name: {feature: importance}} for detailed export
     
     try:
-        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+        from sklearn.model_selection import cross_val_score
         from sklearn.preprocessing import StandardScaler
         import lightgbm as lgb
+        from scripts.utils.purged_time_series_split import PurgedTimeSeriesSplit
+        from scripts.utils.leakage_filtering import _extract_horizon, _load_leakage_config
     except Exception as e:
         logger.warning(f"Failed to import required libraries: {e}")
         return {}, {}, 0.0, {}, {}, {}
@@ -533,10 +536,34 @@ def train_and_evaluate_models(
     cv_folds = cv_config.get('cv_folds', 3)
     cv_n_jobs = cv_config.get('n_jobs', 1)
     
-    # CRITICAL: Use TimeSeriesSplit to enforce temporal causality
-    # Standard K-Fold allows training on future data when testing on past data
-    # This would artificially inflate scores and make targets look more predictable
-    tscv = TimeSeriesSplit(n_splits=cv_folds)
+    # CRITICAL: Use PurgedTimeSeriesSplit to prevent temporal leakage
+    # Standard K-Fold shuffles data randomly, which destroys time patterns
+    # TimeSeriesSplit respects time order but doesn't prevent overlap leakage
+    # PurgedTimeSeriesSplit enforces a gap between train/test = target horizon
+    
+    # Calculate purge_overlap based on target horizon
+    # Extract target horizon (in minutes) from target column name
+    leakage_config = _load_leakage_config()
+    target_horizon_minutes = _extract_horizon(target_column, leakage_config) if target_column else None
+    
+    # Assume data is 5-minute bars (can be made configurable)
+    # Convert horizon from minutes to number of bars
+    data_interval_minutes = 5  # TODO: Make this configurable or auto-detect
+    purge_buffer_bars = 5  # Safety buffer (5 bars = 25 minutes)
+    
+    if target_horizon_minutes is not None:
+        # Convert horizon to bars: 60m target with 5m bars = 12 bars
+        target_horizon_bars = target_horizon_minutes // data_interval_minutes
+        purge_overlap = target_horizon_bars + purge_buffer_bars
+        logger.info(f"  Target horizon: {target_horizon_minutes}m = {target_horizon_bars} bars, purge_overlap: {purge_overlap} bars")
+    else:
+        # Fallback: use a conservative default (60m = 12 bars + buffer)
+        purge_overlap = 17  # 60m / 5m + 5 buffer
+        logger.warning(f"  Could not extract target horizon from '{target_column}', using default purge_overlap={purge_overlap}")
+    
+    # Create purged time series split
+    tscv = PurgedTimeSeriesSplit(n_splits=cv_folds, purge_overlap=purge_overlap)
+    logger.info(f"  Using PurgedTimeSeriesSplit: {cv_folds} folds, purge_overlap={purge_overlap} bars")
     
     if model_families is None:
         # Load from multi-model config if available
@@ -1719,7 +1746,10 @@ def evaluate_target_predictability(
     data_dir: Path,
     model_families: List[str],
     multi_model_config: Dict[str, Any] = None,
-    output_dir: Path = None
+    output_dir: Path = None,
+    min_cs: int = 10,
+    max_cs_samples: Optional[int] = None,
+    max_rows_per_symbol: int = 50000
 ) -> TargetPredictabilityScore:
     """Evaluate predictability of a single target across symbols"""
     
@@ -1745,129 +1775,200 @@ def evaluate_target_predictability(
     logger.info(f"Evaluating: {display_name} ({target_column})")
     logger.info(f"{'='*60}")
     
+    # Load all symbols at once (cross-sectional data loading)
+    from scripts.utils.cross_sectional_data import load_mtf_data_for_ranking, prepare_cross_sectional_data_for_ranking
+    from scripts.utils.leakage_filtering import filter_features_for_target
+    
+    logger.info(f"Loading data for {len(symbols)} symbols (max {max_rows_per_symbol} rows per symbol)...")
+    mtf_data = load_mtf_data_for_ranking(data_dir, symbols, max_rows_per_symbol=max_rows_per_symbol)
+    
+    if not mtf_data:
+        logger.error(f"No data loaded for any symbols")
+        return TargetPredictabilityScore(
+            target_name=target_name,
+            target_column=target_column,
+            task_type=TaskType.REGRESSION,
+            mean_score=-999.0,
+            std_score=1.0,
+            mean_importance=0.0,
+            consistency=0.0,
+            n_models=0,
+            model_scores={}
+        )
+    
+    # Apply leakage filtering to feature list BEFORE preparing data
+    # Get all columns from first symbol to determine available features
+    sample_df = next(iter(mtf_data.values()))
+    all_columns = sample_df.columns.tolist()
+    safe_columns = filter_features_for_target(all_columns, target_column, verbose=True)
+    
+    excluded_count = len(all_columns) - len(safe_columns) - 1  # -1 for target itself
+    logger.info(f"Filtered out {excluded_count} potentially leaking features (kept {len(safe_columns)} safe features)")
+    
+    # Prepare cross-sectional data (matches training pipeline)
+    X, y, feature_names, symbols_array, time_vals = prepare_cross_sectional_data_for_ranking(
+        mtf_data, target_column, min_cs=min_cs, max_cs_samples=max_cs_samples, feature_names=safe_columns
+    )
+    
+    if X is None or y is None:
+        logger.error(f"Failed to prepare cross-sectional data for {target_column}")
+        return TargetPredictabilityScore(
+            target_name=target_name,
+            target_column=target_column,
+            task_type=TaskType.REGRESSION,
+            mean_score=-999.0,
+            std_score=1.0,
+            mean_importance=0.0,
+            consistency=0.0,
+            n_models=0,
+            model_scores={}
+        )
+    
+    logger.info(f"Cross-sectional data: {len(X)} samples, {X.shape[1]} features")
+    logger.info(f"Symbols: {len(set(symbols_array))} unique symbols")
+    
+    # Infer task type from data
+    y_sample = pd.Series(y).dropna()
+    task_type = TaskType.from_target_column(target_column, y_sample.to_numpy())
+    
+    # Validate target
+    is_valid, error_msg = validate_target(y, task_type=task_type)
+    if not is_valid:
+        logger.warning(f"Skipping: {error_msg}")
+        return TargetPredictabilityScore(
+            target_name=target_name,
+            target_column=target_column,
+            task_type=task_type,
+            mean_score=-999.0,
+            std_score=1.0,
+            mean_importance=0.0,
+            consistency=0.0,
+            n_models=0,
+            model_scores={}
+        )
+    
+    # Check if target is degenerate
+    unique_vals = np.unique(y[~np.isnan(y)])
+    if len(unique_vals) < 2:
+        logger.warning(f"Skipping: Target has only {len(unique_vals)} unique value(s)")
+        return TargetPredictabilityScore(
+            target_name=target_name,
+            target_column=target_column,
+            task_type=task_type,
+            mean_score=-999.0,
+            std_score=1.0,
+            mean_importance=0.0,
+            consistency=0.0,
+            n_models=0,
+            model_scores={}
+        )
+    
+    # For classification, check if classes are too imbalanced for CV
+    if len(unique_vals) <= 10:  # Likely classification
+        class_counts = np.bincount(y[~np.isnan(y)].astype(int))
+        min_class_count = class_counts[class_counts > 0].min()
+        if min_class_count < 2:
+            logger.warning(f"Skipping: Smallest class has only {min_class_count} sample(s) (too few for CV)")
+            return TargetPredictabilityScore(
+                target_name=target_name,
+                target_column=target_column,
+                task_type=task_type,
+                mean_score=-999.0,
+                std_score=1.0,
+                mean_importance=0.0,
+                consistency=0.0,
+                n_models=0,
+                model_scores={}
+            )
+    
+    # Train and evaluate on cross-sectional data (single evaluation, not per-symbol)
     all_model_scores = []
     all_importances = []
-    all_suspicious_features = {}  # Aggregate suspicious features across symbols
+    all_suspicious_features = {}
     
-    for symbol in symbols:
-        try:
-            logger.info(f"  {symbol}...")
-            
-            # Load data
-            df = load_sample_data(symbol, data_dir, max_samples=10000)
-            
-            # Prepare features (with target config if available)
-            target_config_obj = target_config if isinstance(target_config, TargetConfig) else None
-            X, y, feature_names, task_type = prepare_features_and_target(
-                df, target_column, target_config_obj
+    try:
+        result = train_and_evaluate_models(
+            X, y, feature_names, task_type, model_families, multi_model_config,
+            target_column=target_column,
+            data_interval_minutes=5  # Assume 5-minute bars (can be made configurable)
+        )
+        
+        if result is None or len(result) != 5:
+            logger.warning(f"train_and_evaluate_models returned unexpected value: {result}")
+            return TargetPredictabilityScore(
+                target_name=target_name,
+                target_column=target_column,
+                task_type=task_type,
+                mean_score=-999.0,
+                std_score=1.0,
+                mean_importance=0.0,
+                consistency=0.0,
+                n_models=0,
+                model_scores={}
             )
-            
-            # Validate target
-            is_valid, error_msg = validate_target(y, task_type=task_type)
-            if not is_valid:
-                logger.warning(f"Skipping {symbol}: {error_msg}")
-                continue
-            
-            # Check if target is degenerate in this sample (single class or too imbalanced)
-            unique_vals = np.unique(y)
-            if len(unique_vals) < 2:
-                logger.warning(f"Skipping: Target has only {len(unique_vals)} unique value(s) in sample")
-                continue
-            
-            # For classification, check if classes are too imbalanced for CV
-            if len(unique_vals) <= 10:  # Likely classification
-                class_counts = np.bincount(y.astype(int))
-                min_class_count = class_counts[class_counts > 0].min()
-                if min_class_count < 2:
-                    logger.warning(f"Skipping: Smallest class has only {min_class_count} sample(s) (too few for CV)")
-                    continue
-            
-            # Train and evaluate (with task type)
-            try:
-                result = train_and_evaluate_models(
-                    X, y, feature_names, task_type, model_families, multi_model_config,
-                    target_column=target_column
-                )
-                # Ensure we got 5 values (handle case where function returns None or wrong number)
-                if result is None or len(result) != 5:
-                    logger.warning(f"train_and_evaluate_models returned unexpected value: {result}")
-                    continue
-                
-                model_metrics, primary_scores, importance, suspicious_features, feature_importances = result
-                
-                # Save detailed feature importances to file (per symbol)
-                if feature_importances:
-                    _save_feature_importances(target_column, symbol, feature_importances, output_dir)
-                
-                # Aggregate feature importances across symbols (for averaging)
-                if not hasattr(evaluate_target_predictability, '_all_feature_importances_agg'):
-                    evaluate_target_predictability._all_feature_importances_agg = {}
-                for model_name, importances in feature_importances.items():
-                    if model_name not in evaluate_target_predictability._all_feature_importances_agg:
-                        evaluate_target_predictability._all_feature_importances_agg[model_name] = {}
-                    for feat, imp in importances.items():
-                        if feat not in evaluate_target_predictability._all_feature_importances_agg[model_name]:
-                            evaluate_target_predictability._all_feature_importances_agg[model_name][feat] = []
-                        evaluate_target_predictability._all_feature_importances_agg[model_name][feat].append(imp)
-                
-                # Aggregate suspicious features across symbols
-                if suspicious_features:
-                    for model_name, features in suspicious_features.items():
-                        if model_name not in all_suspicious_features:
-                            all_suspicious_features[model_name] = []
-                        # Merge features, keeping max importance if duplicate
-                        existing_features = {f[0]: f[1] for f in all_suspicious_features[model_name]}
-                        for feat, imp in features:
-                            if feat in existing_features:
-                                existing_features[feat] = max(existing_features[feat], imp)
-                            else:
-                                existing_features[feat] = imp
-                        all_suspicious_features[model_name] = [
-                            (f, imp) for f, imp in existing_features.items()
-                        ]
-                    
-                    # Log and save suspicious features
-                    _log_suspicious_features(target_column, symbol, suspicious_features)
-                
-                # Convert to old format for backward compatibility
-                # Ensure primary_scores is a dict (handle early returns or errors)
-                if primary_scores is None:
-                    logger.warning(f"primary_scores is None for {symbol}, skipping")
-                    continue
-                if not isinstance(primary_scores, dict):
-                    logger.warning(f"primary_scores is not a dict (got {type(primary_scores)}) for {symbol}, skipping")
-                    continue
-                model_scores = primary_scores
-                
-                # Only append if we have valid scores
-                if model_scores and isinstance(model_scores, dict):
-                    all_model_scores.append(model_scores)
-                    all_importances.append(importance)
-                    
-                    scores_str = ", ".join([f"{k}={v:.3f}" for k, v in model_scores.items()])
-                    logger.info(f"Scores: {scores_str}, importance={importance:.2f}")
-            except Exception as e:
-                # Handle any errors - log full traceback to find the issue
-                import traceback
-                error_msg = str(e)
-                tb_str = traceback.format_exc()
-                logger.warning(f"Failed: {error_msg}")
-                # Always log traceback for .items() errors to find the exact location
-                if "'NoneType' object has no attribute 'items'" in error_msg or "has no attribute 'items'" in error_msg:
-                    logger.error(f"CRITICAL: .items() called on None. Full traceback:")
-                    logger.error(tb_str)
-                    logger.error(f"  Result was: {result}")
-                    logger.error(f"  Result type: {type(result)}")
-                    if result is not None:
-                        logger.error(f"  Result length: {len(result) if hasattr(result, '__len__') else 'N/A'}")
-                        if isinstance(result, (tuple, list)) and len(result) >= 2:
-                            logger.error(f"  primary_scores type: {type(result[1])}")
-                            logger.error(f"  primary_scores value: {result[1]}")
-                continue
-            
-        except Exception as e:
-            logger.warning(f"Failed: {e}")
-            continue
+        
+        model_metrics, primary_scores, importance, suspicious_features, feature_importances = result
+        
+        # Save aggregated feature importances (cross-sectional, not per-symbol)
+        if feature_importances and output_dir:
+            _save_feature_importances(target_column, "CROSS_SECTIONAL", feature_importances, output_dir)
+        
+        # Store suspicious features
+        if suspicious_features:
+            all_suspicious_features = suspicious_features
+            _log_suspicious_features(target_column, "CROSS_SECTIONAL", suspicious_features)
+        
+        # Ensure primary_scores is a dict
+        if primary_scores is None:
+            logger.warning(f"primary_scores is None, skipping")
+            return TargetPredictabilityScore(
+                target_name=target_name,
+                target_column=target_column,
+                task_type=task_type,
+                mean_score=-999.0,
+                std_score=1.0,
+                mean_importance=0.0,
+                consistency=0.0,
+                n_models=0,
+                model_scores={}
+            )
+        if not isinstance(primary_scores, dict):
+            logger.warning(f"primary_scores is not a dict (got {type(primary_scores)}), skipping")
+            return TargetPredictabilityScore(
+                target_name=target_name,
+                target_column=target_column,
+                task_type=task_type,
+                mean_score=-999.0,
+                std_score=1.0,
+                mean_importance=0.0,
+                consistency=0.0,
+                n_models=0,
+                model_scores={}
+            )
+        
+        all_model_scores.append(primary_scores)
+        all_importances.append(importance)
+        
+        scores_str = ", ".join([f"{k}={v:.3f}" for k, v in primary_scores.items()])
+        logger.info(f"Scores: {scores_str}, importance={importance:.2f}")
+        
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        tb_str = traceback.format_exc()
+        logger.warning(f"Failed: {error_msg}")
+        logger.error(f"Full traceback:\n{tb_str}")
+        return TargetPredictabilityScore(
+            target_name=target_name,
+            target_column=target_column,
+            task_type=task_type,
+            mean_score=-999.0,
+            std_score=1.0,
+            mean_importance=0.0,
+            consistency=0.0,
+            n_models=0,
+            model_scores={}
+        )
     
     if not all_model_scores:
         logger.warning(f"No successful evaluations for {target_name} (skipping)")
@@ -1883,7 +1984,8 @@ def evaluate_target_predictability(
             model_scores={}
         )
     
-    # Aggregate across symbols and models (skip NaN scores)
+    # Aggregate across models (skip NaN scores)
+    # Note: With cross-sectional data, we only have one evaluation, not per-symbol
     all_scores_by_model = defaultdict(list)
     for scores_dict in all_model_scores:
         # Defensive check: skip None or non-dict entries
@@ -1917,9 +2019,8 @@ def evaluate_target_predictability(
     mean_importance = np.mean(all_importances)
     consistency = 1.0 - (std_score / (abs(mean_score) + 1e-6))
     
-    # Determine task type from target config (should be consistent across symbols)
-    # Use the task_type from the first successful evaluation
-    final_task_type = target_config_obj.task_type if hasattr(target_config_obj, 'task_type') else TaskType.REGRESSION
+    # Determine task type (already inferred from data above)
+    final_task_type = task_type
     
     # Get metric name for logging
     if final_task_type == TaskType.REGRESSION:
@@ -1960,22 +2061,6 @@ def evaluate_target_predictability(
     
     # Store suspicious features in result for summary report
     result.suspicious_features = all_suspicious_features if all_suspicious_features else None
-    
-    # Save aggregated feature importances (averaged across symbols)
-    if hasattr(evaluate_target_predictability, '_all_feature_importances_agg'):
-        agg_importances = evaluate_target_predictability._all_feature_importances_agg
-        if agg_importances:
-            # Calculate averages
-            avg_importances = {}
-            for model_name, feat_imps in agg_importances.items():
-                avg_importances[model_name] = {
-                    feat: float(np.mean(imps))
-                    for feat, imps in feat_imps.items()
-                }
-            
-            # Save to aggregated file
-            if output_dir:
-                _save_feature_importances(target_column, "AGGREGATED", avg_importances, output_dir)
     
     return result
 
@@ -2134,6 +2219,12 @@ def main():
                        help="Resume from checkpoint if available")
     parser.add_argument("--clear-checkpoint", action="store_true",
                        help="Clear existing checkpoint and start fresh")
+    parser.add_argument("--min-cs", type=int, default=10,
+                       help="Minimum cross-sectional size per timestamp (default: 10)")
+    parser.add_argument("--max-cs-samples", type=int, default=None,
+                       help="Maximum samples per timestamp for cross-sectional sampling (default: 1000)")
+    parser.add_argument("--max-rows-per-symbol", type=int, default=50000,
+                       help="Maximum rows to load per symbol (most recent rows, default: 50000)")
     
     args = parser.parse_args()
     
@@ -2234,7 +2325,8 @@ def main():
         try:
             result = evaluate_target_predictability(
                 target_name, target_config, symbols, args.data_dir, model_families, multi_model_config,
-                output_dir=args.output_dir
+                output_dir=args.output_dir, min_cs=args.min_cs, max_cs_samples=args.max_cs_samples,
+                max_rows_per_symbol=args.max_rows_per_symbol
             )
             
             # Save checkpoint after each target

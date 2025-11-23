@@ -793,7 +793,9 @@ def rank_features_by_ic_and_predictive(
     max_samples: int = 50000,
     ic_weight: float = 0.4,
     predictive_weight: float = 0.6,
-    multi_model_config: Dict[str, Any] = None
+    multi_model_config: Dict[str, Any] = None,
+    min_cs: int = 10,
+    max_cs_samples: Optional[int] = None
 ) -> List[FeatureICScore]:
     """
     Rank features by IC and predictive power across multiple targets
@@ -815,93 +817,105 @@ def rank_features_by_ic_and_predictive(
     logger.info(f"Targets: {len(targets)} targets")
     logger.info(f"Model families: {', '.join(model_families or ['default'])}")
     logger.info(f"IC weight: {ic_weight}, Predictive weight: {predictive_weight}")
+    logger.info(f"Cross-sectional: min_cs={min_cs}, max_cs_samples={max_cs_samples or 1000}")
     logger.info("")
     
-    # Aggregate metrics across symbols and targets
+    # Load all symbols at once (cross-sectional data loading)
+    from scripts.utils.cross_sectional_data import load_mtf_data_for_ranking, prepare_cross_sectional_data_for_ranking
+    from scripts.utils.leakage_filtering import filter_features_for_target
+    
+    logger.info(f"Loading data for {len(symbols)} symbols...")
+    mtf_data = load_mtf_data_for_ranking(data_dir, symbols, max_rows_per_symbol=max_samples)
+    
+    if not mtf_data:
+        logger.error("No data loaded for any symbols")
+        return []
+    
+    # Aggregate metrics across targets (using cross-sectional data)
     all_ic_scores = defaultdict(lambda: defaultdict(list))  # feature -> target -> [ic values]
     all_predictive_scores = defaultdict(lambda: defaultdict(list))  # feature -> target -> [importance values]
     all_model_scores = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))  # feature -> model -> target -> [importances]
     
-    for symbol in symbols:
-        logger.info(f"Processing {symbol}...")
+    # Process each target with cross-sectional data
+    for target_col in targets:
+        logger.info(f"Processing {target_col}...")
         
-        try:
-            df = load_sample_data(symbol, data_dir, max_samples)
-            
-            for target_col in targets:
-                if target_col not in df.columns:
-                    continue
-                
-                logger.info(f"  Evaluating features for {target_col}...")
-                
-                # Filter safe features
-                feature_names = filter_safe_features(df, target_col)
-                
-                if not feature_names:
-                    continue
-                
-                # Prepare target
-                y = df[target_col].dropna()
-                if len(y) < 10:
-                    continue
-                
-                # Compute IC for each feature
-                for feat in feature_names:
-                    if feat not in df.columns:
-                        continue
-                    
-                    feature_series = df[feat]
-                    ic = compute_ic(feature_series, df[target_col])
-                    if not np.isnan(ic):
-                        all_ic_scores[feat][target_col].append(ic)
-                
-                # Compute predictive power (model-based)
-                try:
-                    X = df[feature_names].values
-                    y_arr = df[target_col].values
-                    
-                    # Remove NaN
-                    valid_mask = ~np.isnan(y_arr)
-                    X = X[valid_mask]
-                    y_arr = y_arr[valid_mask]
-                    
-                    if len(y_arr) > 100:  # Need enough samples
-                        # Validate target before computing predictive power
-                        sys.path.insert(0, str(_REPO_ROOT / "scripts" / "utils"))
-                        try:
-                            from target_validation import validate_target
-                            is_valid, error_msg = validate_target(y_arr, min_samples=100, min_class_samples=2)
-                            if not is_valid:
-                                logger.debug(f"    Skipping {target_col}: {error_msg}")
-                            else:
-                                predictive_scores, per_model_scores = compute_predictive_power(
-                                    X, y_arr, feature_names, model_families, multi_model_config
-                                )
-                        except ImportError:
-                            # Fallback
-                            unique_y = np.unique(y_arr[~np.isnan(y_arr)])
-                            if len(unique_y) < 2:
-                                logger.debug(f"    Skipping {target_col}: degenerate target")
-                            else:
-                                predictive_scores, per_model_scores = compute_predictive_power(
-                                    X, y_arr, feature_names, model_families, multi_model_config
-                                )
-                            
-                                for feat, importance in predictive_scores.items():
-                                    if importance > 0:
-                                        all_predictive_scores[feat][target_col].append(importance)
-                                
-                                # Store per-model scores
-                                for model_name, model_feat_scores in per_model_scores.items():
-                                    for feat, imp in model_feat_scores.items():
-                                        if imp > 0:
-                                            all_model_scores[feat][model_name][target_col].append(imp)
-                except Exception as e:
-                    logger.debug(f"    Predictive power failed for {target_col}: {e}")
+        # Check if target exists in any symbol
+        target_found = False
+        for symbol, df in mtf_data.items():
+            if target_col in df.columns:
+                target_found = True
+                break
         
-        except Exception as e:
-            logger.warning(f"  Failed for {symbol}: {e}")
+        if not target_found:
+            logger.debug(f"  Target '{target_col}' not found in any symbol, skipping")
             continue
+        
+        # Apply leakage filtering to feature list BEFORE preparing data
+        sample_df = next(iter(mtf_data.values()))
+        all_columns = sample_df.columns.tolist()
+        safe_columns = filter_features_for_target(all_columns, target_col, verbose=False)
+        
+        logger.info(f"  Filtered to {len(safe_columns)} safe features for {target_col}")
+        
+        # Prepare cross-sectional data (matches training pipeline)
+        X, y, feature_names, symbols_array, time_vals = prepare_cross_sectional_data_for_ranking(
+            mtf_data, target_col, min_cs=min_cs, max_cs_samples=max_cs_samples, feature_names=safe_columns
+        )
+        
+        if X is None or y is None or len(feature_names) == 0:
+            logger.warning(f"  Failed to prepare cross-sectional data for {target_col}")
+            continue
+        
+        logger.info(f"  Cross-sectional data: {len(X)} samples, {len(feature_names)} features")
+        
+        # Compute IC for each feature (on cross-sectional data)
+        # Convert to DataFrame for easier IC computation
+        feature_df = pd.DataFrame(X, columns=feature_names)
+        target_series = pd.Series(y)
+        
+        for feat in feature_names:
+            if feat not in feature_df.columns:
+                continue
+            
+            feature_series = feature_df[feat]
+            ic = compute_ic(feature_series, target_series)
+            if not np.isnan(ic):
+                all_ic_scores[feat][target_col].append(ic)
+        
+        # Compute predictive power (model-based) on cross-sectional data
+        try:
+            if len(y) > 100:  # Need enough samples
+                # Validate target before computing predictive power
+                sys.path.insert(0, str(_REPO_ROOT / "scripts" / "utils"))
+                try:
+                    from target_validation import validate_target
+                    is_valid, error_msg = validate_target(y, min_samples=100, min_class_samples=2)
+                    if not is_valid:
+                        logger.debug(f"    Skipping {target_col}: {error_msg}")
+                        continue
+                except ImportError:
+                    # Fallback
+                    unique_y = np.unique(y[~np.isnan(y)])
+                    if len(unique_y) < 2:
+                        logger.debug(f"    Skipping {target_col}: degenerate target")
+                        continue
+                
+                predictive_scores, per_model_scores = compute_predictive_power(
+                    X, y, feature_names, model_families, multi_model_config
+                )
+                
+                for feat, importance in predictive_scores.items():
+                    if importance > 0:
+                        all_predictive_scores[feat][target_col].append(importance)
+                
+                # Store per-model scores
+                for model_name, model_feat_scores in per_model_scores.items():
+                    for feat, imp in model_feat_scores.items():
+                        if imp > 0:
+                            all_model_scores[feat][model_name][target_col].append(imp)
+        except Exception as e:
+            logger.debug(f"    Predictive power failed for {target_col}: {e}")
     
     # Aggregate across symbols and targets
     logger.info("\nAggregating scores...")
@@ -1202,6 +1216,18 @@ def main():
         action='store_true',
         help='Clear existing checkpoint and start fresh'
     )
+    parser.add_argument(
+        '--min-cs',
+        type=int,
+        default=10,
+        help='Minimum cross-sectional size per timestamp (default: 10)'
+    )
+    parser.add_argument(
+        '--max-cs-samples',
+        type=int,
+        default=None,
+        help='Maximum samples per timestamp for cross-sectional sampling (default: 1000)'
+    )
     
     args = parser.parse_args()
     
@@ -1283,7 +1309,9 @@ def main():
         max_samples=args.max_samples,
         ic_weight=args.ic_weight,
         predictive_weight=args.predictive_weight,
-        multi_model_config=multi_model_config
+        multi_model_config=multi_model_config,
+        min_cs=args.min_cs,
+        max_cs_samples=args.max_cs_samples
     )
     
     # Save checkpoint after processing
