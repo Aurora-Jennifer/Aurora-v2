@@ -537,6 +537,27 @@ def train_model_and_get_importance(
             for v in unique_vals
         )
         
+        # CRITICAL: Use PurgedTimeSeriesSplit to prevent temporal leakage
+        from scripts.utils.purged_time_series_split import PurgedTimeSeriesSplit
+        from scripts.utils.leakage_filtering import _extract_horizon, _load_leakage_config
+        
+        # Calculate purge_overlap from target horizon
+        data_interval_minutes = 5  # Assume 5-minute bars
+        purge_buffer_bars = 5  # Safety buffer
+        
+        leakage_config = _load_leakage_config()
+        target_horizon_minutes = _extract_horizon(target_column, leakage_config) if target_column else None
+        
+        if target_horizon_minutes is not None:
+            target_horizon_bars = target_horizon_minutes // data_interval_minutes
+            purge_overlap = target_horizon_bars + purge_buffer_bars
+        else:
+            # Fallback: conservative default (60m = 12 bars + 5 buffer)
+            purge_overlap = 17
+        
+        # Create purged CV splitter
+        purged_cv = PurgedTimeSeriesSplit(n_splits=3, purge_overlap=purge_overlap)
+        
         n_bootstrap = model_config.get('n_bootstrap', 50)  # Reduced for speed
         stability_scores = np.zeros(X.shape[1])
         
@@ -546,9 +567,9 @@ def train_model_and_get_importance(
             
             try:
                 if is_binary or is_multiclass:
-                    model = LogisticRegressionCV(Cs=10, cv=3, random_state=42, max_iter=1000, n_jobs=1)
+                    model = LogisticRegressionCV(Cs=10, cv=purged_cv, random_state=42, max_iter=1000, n_jobs=1)
                 else:
-                    model = LassoCV(cv=3, random_state=42, max_iter=1000, n_jobs=1)
+                    model = LassoCV(cv=purged_cv, random_state=42, max_iter=1000, n_jobs=1)
                 
                 model.fit(X_boot, y_boot)
                 stability_scores += (np.abs(model.coef_[0] if len(model.coef_.shape) > 1 else model.coef_) > 1e-6).astype(int)

@@ -843,6 +843,10 @@ def train_and_evaluate_models(
             valid_scores = scores[~np.isnan(scores)]
             primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
+            # ⚠️ IMPORTANCE BIAS WARNING: This fits on the full dataset (in-sample)
+            # Deep trees/GBMs can memorize noise, making feature importance biased.
+            # TODO: Future enhancement - use permutation importance calculated on CV test folds
+            # For now, this is acceptable but be aware that importance may be inflated
             model.fit(X, y)
             
             # Check for suspicious scores
@@ -934,6 +938,8 @@ def train_and_evaluate_models(
                         raise
             
             # Fit on raw data (Pipeline handles preprocessing internally)
+            # ⚠️ IMPORTANCE BIAS WARNING: This fits on the full dataset (in-sample)
+            # See comment above for details
             if not np.isnan(primary_score):
                 model.fit(X, y_for_training)
                 
@@ -1115,6 +1121,8 @@ def train_and_evaluate_models(
             valid_scores = scores[~np.isnan(scores)]
             primary_score = valid_scores.mean() if len(valid_scores) > 0 else np.nan
             
+            # ⚠️ IMPORTANCE BIAS WARNING: This fits on the full dataset (in-sample)
+            # See comment above for details
             pipeline.fit(X, y)
             
             # Compute and store full task-aware metrics (Lasso is regression-only)

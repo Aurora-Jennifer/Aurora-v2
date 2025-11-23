@@ -90,10 +90,16 @@ class CrossSectionalProcessor:
     
     def create_group_splits(self, X: np.ndarray, y: np.ndarray, 
                            timestamps: np.ndarray, 
-                           n_splits: int = 5) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-        """Create group-based cross-validation splits (mega script approach)."""
+                           n_splits: int = 5,
+                           purge_overlap: int = 17) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Create group-based cross-validation splits with purge gap (mega script approach).
         
-        logger.info(f"🔧 Creating group-based CV splits for {len(X)} samples")
+        Args:
+            purge_overlap: Number of timestamp groups to purge between train and test
+                          (default: 17 = 60m target / 5m bars + 5 buffer)
+        """
+        
+        logger.info(f"🔧 Creating group-based CV splits for {len(X)} samples (purge={purge_overlap} groups)")
         
         # Create groups based on timestamps
         unique_timestamps = np.unique(timestamps)
@@ -107,11 +113,29 @@ class CrossSectionalProcessor:
         splits = []
         
         for train_idx, val_idx in group_kfold.split(X, y, groups):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
-            splits.append((X_train, X_val, y_train, y_val))
+            # Get unique groups in train and validation
+            train_groups = np.unique(groups[train_idx])
+            val_groups = np.unique(groups[val_idx])
+            
+            # Apply purge: remove last purge_overlap groups from train
+            if len(train_groups) > purge_overlap:
+                max_train_group = train_groups.max() - purge_overlap
+                train_idx_purged = train_idx[groups[train_idx] <= max_train_group]
+            else:
+                # If purge would remove all train groups, use minimum purge
+                min_purge = max(1, len(train_groups) // 10)  # 10% minimum purge
+                max_train_group = train_groups.max() - min_purge
+                train_idx_purged = train_idx[groups[train_idx] <= max_train_group]
+                logger.warning(f"⚠️  Reduced purge from {purge_overlap} to {min_purge} groups due to small dataset")
+            
+            if len(train_idx_purged) > 0:
+                X_train, X_val = X[train_idx_purged], X[val_idx]
+                y_train, y_val = y[train_idx_purged], y[val_idx]
+                splits.append((X_train, X_val, y_train, y_val))
+            else:
+                logger.warning(f"⚠️  Skipping split: purge removed all training samples")
         
-        logger.info(f"✅ Created {len(splits)} group-based CV splits")
+        logger.info(f"✅ Created {len(splits)} group-based CV splits with purge")
         return splits
     
     def apply_cross_sectional_validation(self, X: np.ndarray, y: np.ndarray, 

@@ -146,14 +146,20 @@ def prepare_cross_sectional_data_for_ranking(
             return (None,) * 5
         
         # Apply cross-sectional sampling per timestamp
+        # CRITICAL: Shuffle symbols within each timestamp to avoid bias
+        # If data is sorted alphabetically, we'd always sample AAPL, AMZN, etc. and miss ZZZ
         if max_cs_samples:
-            combined_df["_rn"] = combined_df.groupby(time_col).cumcount()
+            # Add random shuffle column per timestamp group
+            # Use a stable seed per timestamp to ensure reproducibility while avoiding bias
+            combined_df["_shuffle_key"] = combined_df.groupby(time_col)["symbol"].transform(
+                lambda x: np.random.RandomState(hash(str(x.name)) % 2**31).permutation(len(x))
+            )
             combined_df = (combined_df
-                           .sort_values([time_col, "_rn"])
+                           .sort_values([time_col, "_shuffle_key"])
                            .groupby(time_col, group_keys=False)
                            .head(max_cs_samples)
-                           .drop(columns="_rn"))
-            logger.info(f"After max_cs_samples={max_cs_samples} filter: {combined_df.shape}")
+                           .drop(columns=["_shuffle_key"]))
+            logger.info(f"After max_cs_samples={max_cs_samples} filter (shuffled per timestamp): {combined_df.shape}")
     
     # Auto-discover features if not provided
     if feature_names is None:

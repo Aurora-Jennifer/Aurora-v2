@@ -158,12 +158,30 @@ class EnsembleTrainer(BaseModelTrainer):
         logger.info(f"🔧 Thread plan: HGB OMP={self.hgb_omp}, RF mode={rf_mode}")
         
         # 2) Train/val split (only if no external val provided)
+        # CRITICAL: Add purge gap to prevent temporal leakage
         if X_va is None or y_va is None:
             s = int(seed) if seed is not None else 42
-            X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=0.2, random_state=s, shuffle=False  # Chronological for time series
-            )
-            logger.info(f"📊 Split: train={len(X_train)}, val={len(X_val)}")
+            
+            # Calculate split point with purge gap
+            # Use conservative default: 60m target = 17 bars (60/5 + 5 buffer)
+            # If target info available in kwargs, could extract horizon
+            purge_overlap = 17  # Default: 60m target with 5m bars
+            
+            # Split chronologically (no shuffle) with purge gap
+            split_idx = int(len(X) * 0.8)  # 80% train, 20% test
+            purge_end = split_idx - purge_overlap  # Remove purge_overlap from train end
+            
+            if purge_end > 0:
+                X_train, y_train = X[:purge_end], y[:purge_end]
+                X_val, y_val = X[split_idx:], y[split_idx:]
+            else:
+                # If purge would make train set too small, use smaller purge
+                purge_end = max(1, split_idx - 5)  # Minimum 5 bar purge
+                X_train, y_train = X[:purge_end], y[:purge_end]
+                X_val, y_val = X[split_idx:], y[split_idx:]
+                logger.warning(f"⚠️  Purge gap reduced due to small dataset (purge={split_idx - purge_end} bars)")
+            
+            logger.info(f"📊 Split: train={len(X_train)}, val={len(X_val)}, purge_gap={split_idx - purge_end} bars")
         else:
             X_train, y_train = X, y
             X_val, y_val = X_va, y_va

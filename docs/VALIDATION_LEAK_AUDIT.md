@@ -1,52 +1,46 @@
 # Validation Split Leak Audit
 
 **Date**: 2025-11-23  
-**Status**: 🔴 **CRITICAL LEAKS FOUND**
+**Status**: ✅ **ALL CRITICAL LEAKS FIXED**
 
 ## Summary
 
-Found **6 locations** using standard K-Fold or TimeSeriesSplit without purge gap, causing temporal leakage in financial ML.
+Found and fixed **6 critical locations** using standard K-Fold or TimeSeriesSplit without purge gap. All production training and ranking scripts now use `PurgedTimeSeriesSplit` or manual purge logic to prevent temporal leakage in financial ML.
 
 ## Leak Locations
 
-### ✅ FIXED
+### ✅ FIXED (All Critical Leaks Resolved)
+
 1. **`scripts/rank_target_predictability.py`** (line 565)
    - ✅ Now uses `PurgedTimeSeriesSplit` with horizon-based purge_overlap
    - ✅ Calculates purge from target horizon (e.g., 60m target → 17 bars purge)
 
-### ❌ CRITICAL LEAKS (Need Fix)
-
 2. **`scripts/rank_features_by_ic_and_predictive.py`** (line 731-733)
-   - ❌ Uses `LogisticRegressionCV(cv=3)` and `LassoCV(cv=3)`
-   - **Problem**: Standard K-Fold (cv=3) shuffles data randomly
-   - **Impact**: HIGH - Used for feature ranking
-   - **Fix**: Pass `PurgedTimeSeriesSplit` to `cv` parameter
+   - ✅ **FIXED**: Replaced `LogisticRegressionCV(cv=3)` and `LassoCV(cv=3)` with `PurgedTimeSeriesSplit`
+   - ✅ Calculates purge_overlap from target horizon (extracted from target_column)
+   - ✅ Uses horizon-based purge: `target_horizon_bars + 5` buffer
 
 3. **`scripts/multi_model_feature_selection.py`** (line 549-551)
-   - ❌ Uses `LogisticRegressionCV(cv=3)` and `LassoCV(cv=3)`
-   - **Problem**: Standard K-Fold (cv=3) shuffles data randomly
-   - **Impact**: HIGH - Used for feature selection
-   - **Fix**: Pass `PurgedTimeSeriesSplit` to `cv` parameter
+   - ✅ **FIXED**: Replaced `LogisticRegressionCV(cv=3)` and `LassoCV(cv=3)` with `PurgedTimeSeriesSplit`
+   - ✅ Calculates purge_overlap from target horizon
+   - ✅ Applied in `train_model_and_get_importance` function
 
 4. **`TRAINING/unified_training_interface.py`** (line 185)
-   - ❌ Uses `cross_val_score(..., cv=n_splits)`
-   - **Problem**: Standard K-Fold (no purge)
-   - **Impact**: HIGH - Main training interface
-   - **Fix**: Use `PurgedTimeSeriesSplit` instead
+   - ✅ **FIXED**: Replaced `cross_val_score(..., cv=n_splits)` with `PurgedTimeSeriesSplit`
+   - ✅ Uses conservative default purge (17 bars = 60m target)
+   - ✅ Note: Could be enhanced to extract horizon from kwargs if available
 
 5. **`TRAINING/model_fun/ensemble_trainer.py`** (line 163)
-   - ❌ Uses `train_test_split(..., shuffle=False)`
-   - **Problem**: No purge gap between train/test
-   - **Impact**: MEDIUM - Ensemble training
-   - **Fix**: Add purge gap manually or use PurgedTimeSeriesSplit
+   - ✅ **FIXED**: Replaced `train_test_split(..., shuffle=False)` with manual chronological split + purge gap
+   - ✅ Manually calculates split with purge_overlap (default: 17 bars)
+   - ✅ Ensures no temporal leakage between train and validation sets
 
 6. **`TRAINING/processing/cross_sectional.py`** (line 106)
-   - ❌ Uses `GroupKFold(n_splits=n_splits)`
-   - **Problem**: No purge gap for temporal data
-   - **Impact**: MEDIUM - Cross-sectional validation
-   - **Fix**: Need custom GroupKFold with purge (or use PurgedTimeSeriesSplit if timestamps are sequential)
+   - ✅ **FIXED**: Enhanced `GroupKFold` splits with purge logic
+   - ✅ Added `purge_overlap` parameter to `create_group_splits` (default: 17 groups)
+   - ✅ Removes last `purge_overlap` timestamp groups from training set before validation
 
-### ⚠️ LOW PRIORITY (Diagnostic Tools)
+### ⚠️ LOW PRIORITY (Diagnostic Tools - Less Critical)
 
 7. **`scripts/diagnose_leakage.py`** (line 201)
    - ⚠️ Uses `TimeSeriesSplit` (not purged)
@@ -68,28 +62,32 @@ Fold 1: [Train] [GAP] [Test]  ← Gap = target horizon (safe!)
 Fold 2: [Train] [GAP] [Test]  ← Gap = target horizon (safe!)
 ```
 
-## Fix Priority
+## Implementation Details
 
-1. **HIGH**: Fix `rank_features_by_ic_and_predictive.py` and `multi_model_feature_selection.py`
-   - These are used for feature ranking/selection
-   - Leakage here affects all downstream models
+### Purge Calculation
+- **Default**: 17 bars = 60m target / 5m bars + 5 buffer
+- **Horizon-based**: When target_column is available, extracts horizon and calculates: `target_horizon_bars + 5`
+- **Fallback**: Uses conservative default (17 bars) when horizon cannot be extracted
 
-2. **HIGH**: Fix `TRAINING/unified_training_interface.py`
-   - Main training interface
-   - All training goes through this
+### Files Modified
+1. `scripts/utils/purged_time_series_split.py` - New PurgedTimeSeriesSplit class
+2. `scripts/rank_target_predictability.py` - Already fixed (previous work)
+3. `scripts/rank_features_by_ic_and_predictive.py` - Fixed stability_selection CV
+4. `scripts/multi_model_feature_selection.py` - Fixed stability_selection CV
+5. `TRAINING/unified_training_interface.py` - Fixed fallback CV
+6. `TRAINING/model_fun/ensemble_trainer.py` - Fixed train/val split
+7. `TRAINING/processing/cross_sectional.py` - Enhanced GroupKFold with purge
 
-3. **MEDIUM**: Fix `ensemble_trainer.py` and `cross_sectional.py`
-   - Used in production training
-   - Less critical but still important
+## Testing Recommendations
 
-4. **LOW**: Fix `diagnose_leakage.py`
-   - Diagnostic tool only
-   - Can update for consistency
+1. **Verify scores drop**: Previous scores were inflated due to leakage. Expect lower (but more realistic) scores.
+2. **Check purge calculation**: Verify purge_overlap is calculated correctly for different target horizons.
+3. **Test with different targets**: Ensure purge works for 15m, 30m, 60m, etc. targets.
+4. **Monitor validation**: Watch for warnings about reduced purge due to small datasets.
 
-## Next Steps
+## Notes
 
-1. Fix all HIGH priority leaks
-2. Test that scores drop (expected - previous scores were inflated)
-3. Verify purge_overlap is calculated correctly for each target
-4. Update documentation
+- All production training and ranking scripts now use purged validation
+- Diagnostic tools (`diagnose_leakage.py`) still use standard TimeSeriesSplit (acceptable for debugging)
+- Cross-sectional validation now includes purge logic for timestamp groups
 

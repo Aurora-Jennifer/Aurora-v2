@@ -180,9 +180,18 @@ class UnifiedTrainingInterface:
                     X_processed, y_processed, timestamps, trainer, n_splits
                 )
             else:
-                # Fallback to standard CV
+                # CRITICAL: Use PurgedTimeSeriesSplit instead of standard K-Fold
+                # Standard K-Fold shuffles data randomly, causing temporal leakage
+                from scripts.utils.purged_time_series_split import PurgedTimeSeriesSplit
                 from sklearn.model_selection import cross_val_score
-                cv_scores = cross_val_score(trainer, X_processed, y_processed, cv=n_splits)
+                
+                # Use conservative default purge (60m target = 17 bars)
+                # If target_column is available in kwargs, we could extract horizon
+                # For now, use safe default
+                purge_overlap = 17  # 60m / 5m + 5 buffer
+                purged_cv = PurgedTimeSeriesSplit(n_splits=n_splits, purge_overlap=purge_overlap)
+                
+                cv_scores = cross_val_score(trainer, X_processed, y_processed, cv=purged_cv)
                 cv_results = {
                     'mean_score': np.mean(cv_scores),
                     'std_score': np.std(cv_scores),

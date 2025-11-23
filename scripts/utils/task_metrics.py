@@ -227,8 +227,18 @@ def compute_composite_score(
         ic = metrics.get("ic", 0.0)
         r2 = metrics.get("r2", 0.0)
         # Combine: IC weighted 70%, R² weighted 30%
-        # Normalize R² to [-1, 1] range (can be negative)
-        r2_normalized = max(-1.0, min(1.0, r2))
+        # CRITICAL: Don't clamp R² to [-1, 1] - preserve negative values for ranking
+        # Very negative R² (e.g., -5.0) indicates "catastrophically dangerous" targets
+        # that are actively misleading the model. Clamping loses this information.
+        # Instead, use a soft normalization that preserves relative ordering:
+        # - For positive R²: use as-is (already 0-1 range typically)
+        # - For negative R²: preserve the value but apply tanh-like scaling to prevent extreme values
+        if r2 > 1.0:
+            r2_normalized = 1.0  # Cap extremely positive (likely leakage)
+        elif r2 < -10.0:
+            r2_normalized = -10.0  # Cap extremely negative (floor for catastrophic)
+        else:
+            r2_normalized = r2  # Preserve all values in [-10, 1] range
         composite = 0.7 * ic + 0.3 * r2_normalized
         return composite
     
