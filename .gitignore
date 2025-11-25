@@ -1,0 +1,30 @@
+# block data
+data/ 
+datasets/
+*.csv
+*.parquet
+*.h5
+*.pkl
+models/weights/
+results/
+DATA_PROCESSING/data
+dep/
+models/
+logs/
+config/
+catboost_info/
+CONFIG/
+catboost_info
+build_whitepaper.sh
+Aurora_v2_Whitepaper.pdf
+
+# random junk
+__pycahce__/
+*.pay[cod]
+venv/
+.env
+.ipynb_checkpoints/
+
+#sys junk 
+.DS_Store
+*.swp
